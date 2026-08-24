@@ -1,13 +1,21 @@
 package com.managerdownloader.app
 
 import android.Manifest
+import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import com.managerdownloader.app.data.DownloadKind
+import com.managerdownloader.app.data.DownloadRepository
+import com.managerdownloader.app.download.DownloadService
 import com.managerdownloader.app.ui.ManagerDownloaderApp
+import java.io.File
+import java.util.UUID
 
 class MainActivity : ComponentActivity() {
     private val notificationPermissionLauncher =
@@ -21,8 +29,62 @@ class MainActivity : ComponentActivity() {
             notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
 
+        handleIncomingIntent(intent)
+
         setContent {
             ManagerDownloaderApp()
         }
     }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIncomingIntent(intent)
+    }
+
+    private fun handleIncomingIntent(intent: Intent?) {
+        if (intent?.action != Intent.ACTION_VIEW) return
+        val uri = intent.data ?: return
+
+        when {
+            uri.scheme.equals("magnet", true) -> enqueueTorrent(uri.toString(), magnetName(uri))
+            intent.type.equals("application/x-bittorrent", true) ||
+                uri.toString().substringBefore('?').endsWith(".torrent", true) -> {
+                importTorrentUri(uri)?.let { (localUri, name) ->
+                    enqueueTorrent(localUri, name)
+                }
+            }
+        }
+    }
+
+    private fun enqueueTorrent(url: String, name: String?) {
+        DownloadRepository.add(
+            url = url,
+            suggestedFilename = name,
+            kind = DownloadKind.TORRENT
+        )
+        DownloadService.process(this)
+    }
+
+    private fun importTorrentUri(uri: Uri): Pair<String, String?>? = runCatching {
+        if (uri.scheme.equals("http", true) || uri.scheme.equals("https", true)) {
+            return@runCatching uri.toString() to uri.lastPathSegment
+        }
+
+        val name = queryDisplayName(uri) ?: "imported-${UUID.randomUUID()}.torrent"
+        val dir = File(filesDir, "imported-torrents").apply { mkdirs() }
+        val destination = File(dir, "${UUID.randomUUID()}.torrent")
+        contentResolver.openInputStream(uri)?.use { input ->
+            destination.outputStream().use { output -> input.copyTo(output) }
+        } ?: return@runCatching null
+        Uri.fromFile(destination).toString() to name
+    }.getOrNull()
+
+    private fun queryDisplayName(uri: Uri): String? = runCatching {
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) cursor.getString(0) else null
+        }
+    }.getOrNull()
+
+    private fun magnetName(uri: Uri): String? = uri.getQueryParameter("dn")
 }

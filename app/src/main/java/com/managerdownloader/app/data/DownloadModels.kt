@@ -8,10 +8,16 @@ enum class DownloadStatus {
     FAILED
 }
 
+enum class DownloadKind {
+    HTTP,
+    TORRENT
+}
+
 data class DownloadTask(
     val id: String,
     val filename: String,
     val url: String,
+    val kind: DownloadKind = DownloadKind.HTTP,
     val status: DownloadStatus = DownloadStatus.QUEUED,
     val bytesDownloaded: Long = 0L,
     val totalBytes: Long = -1L,
@@ -19,6 +25,7 @@ data class DownloadTask(
     val order: Int = 0,
     val outputPath: String? = null,
     val error: String? = null,
+    val detail: String? = null,
     val cookie: String? = null,
     val userAgent: String? = null
 ) {

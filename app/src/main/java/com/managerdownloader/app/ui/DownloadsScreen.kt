@@ -53,9 +53,12 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.managerdownloader.app.data.DownloadKind
 import com.managerdownloader.app.data.DownloadRepository
 import com.managerdownloader.app.data.DownloadStatus
 import com.managerdownloader.app.data.DownloadTask
+import com.managerdownloader.app.data.QueueMode
+import com.managerdownloader.app.data.SettingsRepository
 import com.managerdownloader.app.download.DownloadService
 
 @Composable
@@ -64,6 +67,7 @@ fun DownloadsScreen(
     onAdd: (String, String?, String?, String?) -> Unit
 ) {
     val downloads by DownloadRepository.downloads.collectAsState()
+    val settings by SettingsRepository.settings.collectAsState()
     val context = LocalContext.current
     var showAddDialog by remember { mutableStateOf(false) }
 
@@ -134,7 +138,11 @@ fun DownloadsScreen(
                 fontWeight = FontWeight.SemiBold
             )
             Text(
-                text = "Solo se descarga un archivo a la vez. Reordena los pendientes con ↑ y ↓.",
+                text = if (settings.queueMode == QueueMode.SEQUENTIAL) {
+                    "Modo uno por uno · hasta ${settings.segmentsPerFile} conexiones por archivo."
+                } else {
+                    "Modo simultáneo · hasta ${settings.maxParallelDownloads} archivos y ${settings.segmentsPerFile} conexiones por archivo."
+                },
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 fontSize = 13.sp
             )
@@ -286,9 +294,14 @@ private fun DownloadCard(
                         maxLines = 1
                     )
                     Text(
-                        text = statusLabel(item.status),
+                        text = buildString {
+                            append(if (item.kind == DownloadKind.TORRENT) "Torrent · " else "HTTP · ")
+                            append(statusLabel(item.status))
+                            item.detail?.takeIf { it.isNotBlank() }?.let { append(" · ").append(it) }
+                        },
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        fontSize = 12.sp
+                        fontSize = 12.sp,
+                        maxLines = 2
                     )
                 }
 
@@ -428,7 +441,7 @@ private fun AddDownloadDialog(
         text = {
             Column {
                 Text(
-                    "Pega una URL directa. Si el enlace abre una página antes de descargar, usa la pestaña Navegador."
+                    "Pega una URL HTTP/HTTPS, un magnet o un enlace .torrent. Si el enlace abre una página antes de descargar, usa la pestaña Navegador."
                 )
                 Spacer(Modifier.height(12.dp))
                 OutlinedTextField(
@@ -441,7 +454,7 @@ private fun AddDownloadDialog(
                     singleLine = true,
                     isError = error,
                     label = { Text("URL") },
-                    placeholder = { Text("https://servidor.com/archivo.zip") }
+                    placeholder = { Text("https://... / magnet:?xt=...") }
                 )
             }
         },
@@ -465,6 +478,10 @@ private fun AddDownloadDialog(
 
 private fun normalizeUrl(value: String): String? {
     val trimmed = value.trim()
+    if (trimmed.startsWith("magnet:", true)) {
+        return trimmed.takeIf { it.contains("xt=urn:bt", ignoreCase = true) }
+    }
+
     val candidate = if (
         trimmed.startsWith("http://", true) ||
         trimmed.startsWith("https://", true)

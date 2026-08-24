@@ -19,7 +19,7 @@ android {
 
         versionName = providers.gradleProperty("VERSION_NAME")
             .orNull
-            ?: "0.2.0"
+            ?: "0.3.0"
     }
 
     buildTypes {
@@ -51,10 +51,9 @@ android {
 }
 
 dependencies {
-    // IMPORTANTE:
-    // 2026.08.00 exige compileSdk 37.
-    // Usamos 2026.06.00 para mantener compileSdk 36.
+    // 2026.06.00 keeps the project compatible with compileSdk 36.
     val composeBom = platform("androidx.compose:compose-bom:2026.06.00")
+    val jlibtorrentVersion = "2.0.12.9"
 
     implementation(composeBom)
     androidTestImplementation(composeBom)
@@ -71,6 +70,12 @@ dependencies {
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    implementation("com.frostwire:jlibtorrent:$jlibtorrentVersion")
+    implementation("com.frostwire:jlibtorrent-android-arm:$jlibtorrentVersion")
+    implementation("com.frostwire:jlibtorrent-android-arm64:$jlibtorrentVersion")
+    implementation("com.frostwire:jlibtorrent-android-x86:$jlibtorrentVersion")
+    implementation("com.frostwire:jlibtorrent-android-x86_64:$jlibtorrentVersion")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

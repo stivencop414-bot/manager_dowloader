@@ -10,231 +10,555 @@ import android.content.Intent
 import android.os.Build
 import android.os.Environment
 import android.os.IBinder
+import android.webkit.URLUtil
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import com.frostwire.jlibtorrent.TorrentHandle
 import com.managerdownloader.app.MainActivity
+import com.managerdownloader.app.data.DownloadKind
 import com.managerdownloader.app.data.DownloadRepository
 import com.managerdownloader.app.data.DownloadStatus
 import com.managerdownloader.app.data.DownloadTask
+import com.managerdownloader.app.data.SettingsRepository
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
 import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.io.IOException
 import java.io.RandomAccessFile
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicLongArray
+import java.util.concurrent.atomic.AtomicReference
 import okhttp3.Call
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 
+internal class TransferControl(val id: String) {
+    val stopped = AtomicBoolean(false)
+    val deleteOnStop = AtomicBoolean(false)
+    val calls = CopyOnWriteArrayList<Call>()
+
+    @Volatile
+    var torrentHandle: TorrentHandle? = null
+
+    fun pause() {
+        stopped.set(true)
+        torrentHandle?.let { runCatching { it.pause() } }
+        calls.forEach { it.cancel() }
+    }
+
+    fun cancel() {
+        deleteOnStop.set(true)
+        stopped.set(true)
+        torrentHandle?.let { runCatching { it.pause() } }
+        calls.forEach { it.cancel() }
+    }
+}
+
 class DownloadService : Service() {
-    private val executor = Executors.newSingleThreadExecutor()
-    private val processing = AtomicBoolean(false)
-    private val stopRequested = AtomicBoolean(false)
+    private val transferExecutor = Executors.newCachedThreadPool()
+    private val segmentExecutor = Executors.newFixedThreadPool(12)
+    private val schedulerLock = Any()
+    private val active = ConcurrentHashMap<String, TransferControl>()
+    private val shuttingDown = AtomicBoolean(false)
 
     private val client = OkHttpClient.Builder()
         .followRedirects(true)
         .followSslRedirects(true)
         .retryOnConnectionFailure(true)
+        .connectTimeout(20, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(5, java.util.concurrent.TimeUnit.MINUTES)
+        .writeTimeout(2, java.util.concurrent.TimeUnit.MINUTES)
         .build()
 
-    @Volatile
-    private var activeCall: Call? = null
-
-    @Volatile
-    private var activeId: String? = null
+    private lateinit var torrentEngine: TorrentEngine
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        torrentEngine = TorrentEngine(this, client, ::downloadsDirectory)
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        stopRequested.set(false)
-        ensureForeground("Preparando cola…")
+        ensureForeground("Preparando transferencias…")
 
         when (intent?.action) {
-            ACTION_PAUSE -> {
-                intent.getStringExtra(EXTRA_ID)?.let { id ->
-                    DownloadRepository.pause(id)
-                    if (activeId == id) activeCall?.cancel()
-                }
-            }
-
-            ACTION_RESUME -> {
-                intent.getStringExtra(EXTRA_ID)?.let(DownloadRepository::resume)
-            }
-
-            ACTION_CANCEL -> {
-                intent.getStringExtra(EXTRA_ID)?.let { id ->
-                    if (activeId == id) activeCall?.cancel()
-                    deletePartial(id)
-                    DownloadRepository.remove(id)
-                }
-            }
+            ACTION_PAUSE -> intent.getStringExtra(EXTRA_ID)?.let(::pauseInternal)
+            ACTION_RESUME -> intent.getStringExtra(EXTRA_ID)?.let(::resumeInternal)
+            ACTION_CANCEL -> intent.getStringExtra(EXTRA_ID)?.let(::cancelInternal)
+            ACTION_PROCESS, null -> Unit
         }
 
-        processQueue()
+        schedule()
         return START_STICKY
     }
 
-    private fun processQueue() {
-        if (!processing.compareAndSet(false, true)) return
+    private fun pauseInternal(id: String) {
+        DownloadRepository.pause(id)
+        active[id]?.pause()
+        torrentEngine.pause(id)
+    }
 
-        executor.execute {
-            try {
-                while (!stopRequested.get()) {
-                    val task = DownloadRepository.nextQueued() ?: break
-                    DownloadRepository.markActive(task.id)
-                    performDownload(task)
-                }
-            } finally {
-                processing.set(false)
-                DownloadRepository.flush()
+    private fun resumeInternal(id: String) {
+        DownloadRepository.resume(id)
+        torrentEngine.resume(id)
+    }
 
-                if (DownloadRepository.nextQueued() != null) {
-                    processQueue()
-                } else {
-                    activeCall = null
-                    activeId = null
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelf()
+    private fun cancelInternal(id: String) {
+        active[id]?.cancel()
+        torrentEngine.cancel(id)
+        cleanupHttpParts(id)
+        DownloadRepository.remove(id)
+    }
+
+    /**
+     * Starts as many queued items as allowed by the selected queue mode.
+     * SEQUENTIAL = 1 active item. PARALLEL = user-selected 2..6 active items.
+     */
+    private fun schedule() {
+        if (shuttingDown.get()) return
+
+        synchronized(schedulerLock) {
+            val settings = SettingsRepository.settings.value
+            val limit = settings.activeTransferLimit
+            val slots = (limit - active.size).coerceAtLeast(0)
+
+            if (slots > 0) {
+                DownloadRepository.queued(slots).forEach { task ->
+                    if (active.containsKey(task.id)) return@forEach
+                    val control = TransferControl(task.id)
+                    if (active.putIfAbsent(task.id, control) != null) return@forEach
+
+                    DownloadRepository.markActive(
+                        task.id,
+                        if (task.kind == DownloadKind.TORRENT) "Preparando torrent…" else "Analizando servidor…"
+                    )
+
+                    transferExecutor.execute {
+                        try {
+                            when (task.kind) {
+                                DownloadKind.HTTP -> downloadHttp(task, control)
+                                DownloadKind.TORRENT -> torrentEngine.download(task, control, limit)
+                            }
+                        } catch (error: Throwable) {
+                            val current = DownloadRepository.find(task.id)
+                            if (
+                                current != null &&
+                                current.status == DownloadStatus.ACTIVE &&
+                                !control.stopped.get()
+                            ) {
+                                DownloadRepository.markFailed(
+                                    task.id,
+                                    error.message ?: error.javaClass.simpleName
+                                )
+                            }
+                        } finally {
+                            if (control.deleteOnStop.get()) cleanupHttpParts(task.id)
+                            active.remove(task.id)
+                            DownloadRepository.flush()
+                            schedule()
+                        }
+                    }
                 }
+            }
+
+            updateAggregateNotification()
+
+            if (active.isEmpty() && !DownloadRepository.hasQueued()) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
             }
         }
     }
 
-    private fun performDownload(original: DownloadTask) {
-        val latest = DownloadRepository.find(original.id) ?: return
-        if (latest.status != DownloadStatus.ACTIVE) return
+    private fun downloadHttp(task: DownloadTask, control: TransferControl) {
+        val probe = probeServer(task, control)
+        if (control.stopped.get()) return
 
-        activeId = latest.id
-        val partialFile = partialFile(latest.id)
-        partialFile.parentFile?.mkdirs()
+        val filename = probe.filename.takeIf { it.isNotBlank() } ?: task.filename
+        DownloadRepository.updateMetadata(
+            task.id,
+            filename = filename,
+            totalBytes = probe.totalBytes.takeIf { it > 0 },
+            detail = if (probe.supportsRanges) "Servidor compatible con descarga segmentada" else "Descarga de flujo único"
+        )
 
-        var existingBytes = partialFile.length().coerceAtLeast(0L)
+        val safeFilename = DownloadRepository.find(task.id)?.filename ?: task.filename
+        val requestedSegments = SettingsRepository.settings.value.segmentsPerFile
+        val segmentCount = chooseSegmentCount(probe.totalBytes, requestedSegments, probe.supportsRanges)
 
-        val requestBuilder = Request.Builder()
-            .url(latest.url)
+        if (segmentCount > 1 && probe.totalBytes > 0) {
+            downloadSegmented(
+                task.copy(filename = safeFilename),
+                probe.totalBytes,
+                segmentCount,
+                probe.validator,
+                control
+            )
+        } else {
+            prepareSingleLayout(task.id, probe.totalBytes, probe.validator)
+            downloadSingle(task.copy(filename = safeFilename), probe.validator, control)
+        }
+    }
+
+    private data class HttpProbe(
+        val supportsRanges: Boolean,
+        val totalBytes: Long,
+        val filename: String,
+        val validator: String?
+    )
+
+    private fun probeServer(task: DownloadTask, control: TransferControl): HttpProbe {
+        val builder = requestBuilder(task)
+            .header("Range", "bytes=0-0")
+            .header("Accept-Encoding", "identity")
             .get()
 
-        if (existingBytes > 0L) {
-            requestBuilder.header("Range", "bytes=$existingBytes-")
+        val call = client.newCall(builder.build())
+        control.calls.add(call)
+
+        return call.execute().use { response ->
+            if (control.stopped.get()) throw IOException("Transferencia detenida")
+            if (!response.isSuccessful && response.code != 416) {
+                throw IOException("HTTP ${response.code}")
+            }
+
+            val contentRange = response.header("Content-Range")
+            val rangeTotal = contentRange
+                ?.substringAfterLast('/', "")
+                ?.takeIf { it != "*" }
+                ?.toLongOrNull()
+
+            val supportsRanges = response.code == 206 && rangeTotal != null && rangeTotal > 1
+            val contentLength = response.body?.contentLength() ?: -1L
+            val total = when {
+                rangeTotal != null && rangeTotal > 0 -> rangeTotal
+                response.code == 200 && contentLength > 0 -> contentLength
+                else -> -1L
+            }
+
+            val guessed = URLUtil.guessFileName(
+                response.request.url.toString(),
+                response.header("Content-Disposition"),
+                response.header("Content-Type")
+            )
+
+            val etag = response.header("ETag")
+                ?.takeIf { !it.trimStart().startsWith("W/", ignoreCase = true) }
+            val validator = etag ?: response.header("Last-Modified")
+
+            HttpProbe(
+                supportsRanges = supportsRanges,
+                totalBytes = total,
+                filename = guessed,
+                validator = validator
+            )
+        }
+    }
+
+    private fun chooseSegmentCount(total: Long, requested: Int, rangeSupported: Boolean): Int {
+        if (!rangeSupported || total <= 0L) return 1
+        val desired = requested.coerceIn(1, 8)
+        return when {
+            total < 8L * 1024L * 1024L -> 1
+            total < 32L * 1024L * 1024L -> desired.coerceAtMost(2)
+            total < 128L * 1024L * 1024L -> desired.coerceAtMost(4)
+            else -> desired
+        }
+    }
+
+    private fun downloadSegmented(
+        task: DownloadTask,
+        totalBytes: Long,
+        segmentCount: Int,
+        validator: String?,
+        control: TransferControl
+    ) {
+        prepareSegmentLayout(task.id, totalBytes, segmentCount, validator)
+        val segments = createSegments(totalBytes, segmentCount)
+        val progress = AtomicLongArray(segmentCount)
+        segments.forEachIndexed { index, segment ->
+            val file = segmentFile(task.id, index)
+            val validLength = file.length().coerceIn(0L, segment.length)
+            if (file.length() != validLength) RandomAccessFile(file, "rw").use { it.setLength(validLength) }
+            progress.set(index, validLength)
         }
 
-        latest.cookie?.takeIf { it.isNotBlank() }?.let {
-            requestBuilder.header("Cookie", it)
-        }
+        val initialDone = (0 until segmentCount).sumOf { progress.get(it) }
+        DownloadRepository.updateProgress(
+            task.id,
+            initialDone,
+            totalBytes,
+            0L,
+            "$segmentCount conexiones · reanudación por segmentos"
+        )
 
-        latest.userAgent?.takeIf { it.isNotBlank() }?.let {
-            requestBuilder.header("User-Agent", it)
-        }
+        val latch = CountDownLatch(segmentCount)
+        val firstError = AtomicReference<Throwable?>(null)
+        val progressLock = Any()
+        val lastUpdate = AtomicLong(System.currentTimeMillis())
+        val lastBytes = AtomicLong(initialDone)
 
-        val call = client.newCall(requestBuilder.build())
-        activeCall = call
-
-        try {
-            call.execute().use { response ->
-                if (!response.isSuccessful) {
-                    throw IOException("HTTP ${response.code}")
+        segments.forEachIndexed { index, segment ->
+            segmentExecutor.execute {
+                try {
+                    downloadRange(
+                        task = task,
+                        index = index,
+                        segment = segment,
+                        progress = progress,
+                        totalBytes = totalBytes,
+                        segmentCount = segmentCount,
+                        validator = validator,
+                        control = control,
+                        progressLock = progressLock,
+                        lastUpdate = lastUpdate,
+                        lastBytes = lastBytes
+                    )
+                } catch (error: Throwable) {
+                    if (!control.stopped.get()) {
+                        firstError.compareAndSet(null, error)
+                        control.calls.forEach { it.cancel() }
+                    }
+                } finally {
+                    latch.countDown()
                 }
+            }
+        }
 
-                val body = response.body ?: throw IOException("Respuesta sin contenido")
+        latch.await()
+        if (control.stopped.get()) return
+        firstError.get()?.let { throw it }
 
-                if (existingBytes > 0L && response.code == 200) {
-                    RandomAccessFile(partialFile, "rw").use { it.setLength(0L) }
-                    existingBytes = 0L
-                }
+        val finalFile = uniqueFinalFile(task.filename)
+        mergeSegments(task.id, segmentCount, finalFile)
+        deleteSegmentFiles(task.id)
 
-                val totalBytes = resolveTotalBytes(response, existingBytes)
-                var downloaded = existingBytes
+        DownloadRepository.markCompleted(task.id, finalFile.absolutePath, finalFile.length())
+        showCompletedNotification(task.filename)
+    }
 
-                RandomAccessFile(partialFile, "rw").use { output ->
-                    output.seek(existingBytes)
+    private data class ByteSegment(val start: Long, val end: Long) {
+        val length: Long get() = end - start + 1L
+    }
 
-                    body.byteStream().use { input ->
-                        val buffer = ByteArray(DEFAULT_BUFFER_SIZE * 8)
-                        var lastUpdateAt = System.currentTimeMillis()
-                        var bytesAtLastUpdate = downloaded
+    private fun createSegments(totalBytes: Long, count: Int): List<ByteSegment> {
+        val base = totalBytes / count
+        val remainder = totalBytes % count
+        var cursor = 0L
+        return List(count) { index ->
+            val length = base + if (index < remainder) 1L else 0L
+            val segment = ByteSegment(cursor, cursor + length - 1L)
+            cursor += length
+            segment
+        }
+    }
 
-                        while (true) {
-                            val read = input.read(buffer)
-                            if (read == -1) break
+    private fun downloadRange(
+        task: DownloadTask,
+        index: Int,
+        segment: ByteSegment,
+        progress: AtomicLongArray,
+        totalBytes: Long,
+        segmentCount: Int,
+        validator: String?,
+        control: TransferControl,
+        progressLock: Any,
+        lastUpdate: AtomicLong,
+        lastBytes: AtomicLong
+    ) {
+        val file = segmentFile(task.id, index)
+        file.parentFile?.mkdirs()
+        val existing = file.length().coerceIn(0L, segment.length)
+        progress.set(index, existing)
+        if (existing >= segment.length) return
 
-                            val current = DownloadRepository.find(latest.id) ?: return
-                            if (current.status == DownloadStatus.PAUSED) {
-                                call.cancel()
-                                return
-                            }
+        val requestStart = segment.start + existing
+        val builder = requestBuilder(task)
+            .header("Range", "bytes=$requestStart-${segment.end}")
+            .header("Accept-Encoding", "identity")
+            .get()
+        validator?.takeIf { it.isNotBlank() }?.let { builder.header("If-Range", it) }
 
-                            output.write(buffer, 0, read)
-                            downloaded += read
+        val call = client.newCall(builder.build())
+        control.calls.add(call)
 
-                            val now = System.currentTimeMillis()
-                            if (now - lastUpdateAt >= 700) {
-                                val elapsedMs = (now - lastUpdateAt).coerceAtLeast(1L)
-                                val delta = downloaded - bytesAtLastUpdate
-                                val speed = (delta * 1000L) / elapsedMs
+        call.execute().use { response ->
+            if (response.code != 206) throw IOException("El servidor dejó de aceptar rangos (HTTP ${response.code})")
+            val body = response.body ?: throw IOException("Respuesta sin contenido")
 
-                                DownloadRepository.updateProgress(
-                                    latest.id,
-                                    downloaded,
-                                    totalBytes,
-                                    speed
-                                )
-                                updateNotification(latest.filename, downloaded, totalBytes)
+            RandomAccessFile(file, "rw").use { output ->
+                output.seek(existing)
+                body.byteStream().use { input ->
+                    val buffer = ByteArray(128 * 1024)
+                    while (!control.stopped.get()) {
+                        val read = input.read(buffer)
+                        if (read == -1) break
+                        output.write(buffer, 0, read)
+                        progress.addAndGet(index, read.toLong())
 
-                                lastUpdateAt = now
-                                bytesAtLastUpdate = downloaded
+                        val now = System.currentTimeMillis()
+                        if (now - lastUpdate.get() >= 450L) {
+                            synchronized(progressLock) {
+                                if (now - lastUpdate.get() >= 450L) {
+                                    val downloaded = (0 until segmentCount).sumOf { progress.get(it) }
+                                    val previousBytes = lastBytes.getAndSet(downloaded)
+                                    val previousTime = lastUpdate.getAndSet(now)
+                                    val elapsed = (now - previousTime).coerceAtLeast(1L)
+                                    val speed = ((downloaded - previousBytes).coerceAtLeast(0L) * 1000L) / elapsed
+                                    DownloadRepository.updateProgress(
+                                        task.id,
+                                        downloaded,
+                                        totalBytes,
+                                        speed,
+                                        "$segmentCount conexiones activas"
+                                    )
+                                    updateAggregateNotification()
+                                }
                             }
                         }
                     }
                 }
-
-                val finalFile = uniqueFinalFile(latest.filename)
-                if (!partialFile.renameTo(finalFile)) {
-                    partialFile.copyTo(finalFile, overwrite = false)
-                    partialFile.delete()
-                }
-
-                DownloadRepository.markCompleted(
-                    latest.id,
-                    finalFile.absolutePath,
-                    finalFile.length()
-                )
-                showCompletedNotification(latest.filename)
             }
-        } catch (error: Exception) {
-            val current = DownloadRepository.find(latest.id)
-            if (current == null || current.status == DownloadStatus.PAUSED) {
-                return
-            }
-
-            if (call.isCanceled()) {
-                return
-            }
-
-            DownloadRepository.markFailed(
-                latest.id,
-                error.message ?: "Error de descarga"
-            )
-        } finally {
-            activeCall = null
-            activeId = null
-            DownloadRepository.flush()
         }
+
+        if (!control.stopped.get() && file.length() < segment.length) {
+            throw IOException("Segmento ${index + 1} incompleto")
+        }
+    }
+
+    private fun downloadSingle(task: DownloadTask, validator: String?, control: TransferControl) {
+        val partial = partialFile(task.id)
+        partial.parentFile?.mkdirs()
+        var existing = partial.length().coerceAtLeast(0L)
+
+        val builder = requestBuilder(task)
+            .header("Accept-Encoding", "identity")
+            .get()
+        if (existing > 0) {
+            builder.header("Range", "bytes=$existing-")
+            validator?.takeIf { it.isNotBlank() }?.let { builder.header("If-Range", it) }
+        }
+
+        val call = client.newCall(builder.build())
+        control.calls.add(call)
+
+        call.execute().use { response ->
+            if (!response.isSuccessful) throw IOException("HTTP ${response.code}")
+            val body = response.body ?: throw IOException("Respuesta sin contenido")
+
+            if (existing > 0 && response.code == 200) {
+                RandomAccessFile(partial, "rw").use { it.setLength(0L) }
+                existing = 0L
+            }
+
+            val filename = URLUtil.guessFileName(
+                response.request.url.toString(),
+                response.header("Content-Disposition"),
+                response.header("Content-Type")
+            ).takeIf { it.isNotBlank() } ?: task.filename
+
+            val total = resolveTotalBytes(response, existing)
+            DownloadRepository.updateMetadata(task.id, filename = filename, totalBytes = total.takeIf { it > 0 })
+
+            var downloaded = existing
+            var lastBytes = downloaded
+            var lastTime = System.currentTimeMillis()
+
+            RandomAccessFile(partial, "rw").use { output ->
+                output.seek(existing)
+                body.byteStream().use { input ->
+                    val buffer = ByteArray(256 * 1024)
+                    while (!control.stopped.get()) {
+                        val read = input.read(buffer)
+                        if (read == -1) break
+                        output.write(buffer, 0, read)
+                        downloaded += read
+
+                        val now = System.currentTimeMillis()
+                        if (now - lastTime >= 500L) {
+                            val speed = ((downloaded - lastBytes) * 1000L) / (now - lastTime).coerceAtLeast(1L)
+                            DownloadRepository.updateProgress(task.id, downloaded, total, speed, "1 conexión")
+                            updateAggregateNotification()
+                            lastBytes = downloaded
+                            lastTime = now
+                        }
+                    }
+                }
+            }
+
+            if (control.stopped.get()) return@use
+
+            val currentName = DownloadRepository.find(task.id)?.filename ?: filename
+            val finalFile = uniqueFinalFile(currentName)
+            if (!partial.renameTo(finalFile)) {
+                partial.copyTo(finalFile, overwrite = false)
+                partial.delete()
+            }
+
+            DownloadRepository.markCompleted(task.id, finalFile.absolutePath, finalFile.length())
+            runCatching { singleMetaFile(task.id).delete() }
+            showCompletedNotification(currentName)
+        }
+    }
+
+    private fun requestBuilder(task: DownloadTask): Request.Builder {
+        val builder = Request.Builder().url(task.url)
+        task.cookie?.takeIf { it.isNotBlank() }?.let { builder.header("Cookie", it) }
+        task.userAgent?.takeIf { it.isNotBlank() }?.let { builder.header("User-Agent", it) }
+        return builder
     }
 
     private fun resolveTotalBytes(response: Response, existingBytes: Long): Long {
         val contentRange = response.header("Content-Range")
-        if (!contentRange.isNullOrBlank()) {
-            val total = contentRange.substringAfterLast('/').toLongOrNull()
-            if (total != null && total > 0) return total
-        }
-
+        val rangeTotal = contentRange?.substringAfterLast('/')?.toLongOrNull()
+        if (rangeTotal != null && rangeTotal > 0) return rangeTotal
         val contentLength = response.body?.contentLength() ?: -1L
         return if (contentLength > 0) contentLength + existingBytes else -1L
+    }
+
+    private fun prepareSegmentLayout(id: String, total: Long, count: Int, validator: String?) {
+        val meta = segmentMetaFile(id)
+        val expected = "$total|$count|${validator.orEmpty()}"
+        val existing = runCatching { meta.takeIf { it.exists() }?.readText() }.getOrNull()
+        if (existing != expected) {
+            deleteSegmentFiles(id)
+            meta.parentFile?.mkdirs()
+            meta.writeText(expected)
+        }
+    }
+
+
+    private fun prepareSingleLayout(id: String, total: Long, validator: String?) {
+        val meta = singleMetaFile(id)
+        val expected = "$total|${validator.orEmpty()}"
+        val existing = runCatching { meta.takeIf { it.exists() }?.readText() }.getOrNull()
+        if (existing != expected && partialFile(id).exists()) {
+            // Old or mismatched partial data cannot be safely resumed against a
+            // resource whose validator/size we cannot prove is identical.
+            runCatching { partialFile(id).delete() }
+        }
+        meta.parentFile?.mkdirs()
+        meta.writeText(expected)
+    }
+
+    private fun mergeSegments(id: String, count: Int, destination: File) {
+        BufferedOutputStream(FileOutputStream(destination), 512 * 1024).use { output ->
+            for (index in 0 until count) {
+                BufferedInputStream(FileInputStream(segmentFile(id, index)), 256 * 1024).use { input ->
+                    input.copyTo(output, 256 * 1024)
+                }
+            }
+        }
     }
 
     private fun downloadsDirectory(): File {
@@ -243,8 +567,24 @@ class DownloadService : Service() {
         return File(base, "ManagerDownloader").apply { mkdirs() }
     }
 
-    private fun partialFile(id: String): File =
-        File(downloadsDirectory(), ".$id.part")
+    private fun partialFile(id: String): File = File(downloadsDirectory(), ".$id.part")
+    private fun segmentFile(id: String, index: Int): File = File(downloadsDirectory(), ".$id.seg$index")
+    private fun segmentMetaFile(id: String): File = File(downloadsDirectory(), ".$id.segments")
+    private fun singleMetaFile(id: String): File = File(downloadsDirectory(), ".$id.singlemeta")
+
+    private fun deleteSegmentFiles(id: String) {
+        downloadsDirectory().listFiles()?.forEach { file ->
+            if (file.name == ".$id.segments" || file.name.startsWith(".$id.seg")) {
+                runCatching { file.delete() }
+            }
+        }
+    }
+
+    private fun cleanupHttpParts(id: String) {
+        runCatching { partialFile(id).delete() }
+        runCatching { singleMetaFile(id).delete() }
+        deleteSegmentFiles(id)
+    }
 
     private fun uniqueFinalFile(filename: String): File {
         val dir = downloadsDirectory()
@@ -254,7 +594,6 @@ class DownloadService : Service() {
         val dot = filename.lastIndexOf('.')
         val base = if (dot > 0) filename.substring(0, dot) else filename
         val ext = if (dot > 0) filename.substring(dot) else ""
-
         var index = 1
         while (candidate.exists()) {
             candidate = File(dir, "$base ($index)$ext")
@@ -263,28 +602,24 @@ class DownloadService : Service() {
         return candidate
     }
 
-    private fun deletePartial(id: String) {
-        runCatching { partialFile(id).delete() }
-    }
-
     private fun ensureForeground(text: String) {
-        startForeground(
-            NOTIFICATION_ID,
-            buildNotification("Manager Downloader", text, -1)
-        )
+        startForeground(NOTIFICATION_ID, buildNotification("Manager Downloader", text, -1))
     }
 
-    private fun updateNotification(filename: String, downloaded: Long, total: Long) {
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.notify(
+    private fun updateAggregateNotification() {
+        val tasks = DownloadRepository.downloads.value.filter { it.status == DownloadStatus.ACTIVE }
+        if (tasks.isEmpty()) return
+        val speed = tasks.sumOf { it.speedBytesPerSecond }
+        val title = if (tasks.size == 1) tasks.first().filename else "${tasks.size} descargas activas"
+        val text = "${formatBytes(speed)}/s · ${SettingsRepository.settings.value.queueMode.name.lowercase()}"
+        getSystemService(NotificationManager::class.java).notify(
             NOTIFICATION_ID,
-            buildNotification(filename, formatProgress(downloaded, total), progressPercent(downloaded, total))
+            buildNotification(title, text, -1)
         )
     }
 
     private fun showCompletedNotification(filename: String) {
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.notify(
+        getSystemService(NotificationManager::class.java).notify(
             filename.hashCode(),
             NotificationCompat.Builder(this, CHANNEL_ID)
                 .setSmallIcon(android.R.drawable.stat_sys_download_done)
@@ -296,11 +631,7 @@ class DownloadService : Service() {
         )
     }
 
-    private fun buildNotification(
-        title: String,
-        text: String,
-        progress: Int
-    ): Notification {
+    private fun buildNotification(title: String, text: String, progress: Int): Notification {
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setContentTitle(title)
@@ -308,62 +639,46 @@ class DownloadService : Service() {
             .setOnlyAlertOnce(true)
             .setOngoing(true)
             .setContentIntent(contentIntent())
-
-        if (progress in 0..100) {
-            builder.setProgress(100, progress, false)
-        } else {
-            builder.setProgress(0, 0, true)
-        }
-
+        if (progress in 0..100) builder.setProgress(100, progress, false)
         return builder.build()
     }
 
-    private fun contentIntent(): PendingIntent {
-        val intent = Intent(this, MainActivity::class.java)
-        return PendingIntent.getActivity(
-            this,
-            0,
-            intent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-    }
+    private fun contentIntent(): PendingIntent = PendingIntent.getActivity(
+        this,
+        0,
+        Intent(this, MainActivity::class.java),
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+    )
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(
-                NotificationChannel(
-                    CHANNEL_ID,
-                    "Descargas",
-                    NotificationManager.IMPORTANCE_LOW
-                ).apply {
-                    description = "Progreso de las descargas"
+            getSystemService(NotificationManager::class.java).createNotificationChannel(
+                NotificationChannel(CHANNEL_ID, "Descargas", NotificationManager.IMPORTANCE_LOW).apply {
+                    description = "Progreso de descargas HTTP y torrent"
                 }
             )
         }
     }
 
     override fun onTimeout(startId: Int, fgsType: Int) {
-        stopRequested.set(true)
-        activeId?.let(DownloadRepository::pause)
-        activeCall?.cancel()
+        // Android 15+ may time out long dataSync FGS sessions. Preserve partial data.
+        shuttingDown.set(true)
+        active.forEach { (id, control) ->
+            DownloadRepository.pause(id)
+            control.pause()
+        }
         stopSelf()
     }
 
     override fun onDestroy() {
-        activeCall?.cancel()
-        executor.shutdownNow()
+        shuttingDown.set(true)
+        active.forEach { (_, control) -> control.pause() }
+        torrentEngine.stopAsync()
+        transferExecutor.shutdownNow()
+        segmentExecutor.shutdownNow()
         DownloadRepository.flush()
         super.onDestroy()
     }
-
-    private fun formatProgress(downloaded: Long, total: Long): String =
-        if (total > 0) "${formatBytes(downloaded)} de ${formatBytes(total)}"
-        else formatBytes(downloaded)
-
-    private fun progressPercent(downloaded: Long, total: Long): Int =
-        if (total > 0) ((downloaded * 100L) / total).toInt().coerceIn(0, 100)
-        else -1
 
     private fun formatBytes(bytes: Long): String {
         if (bytes < 1024) return "$bytes B"
@@ -377,28 +692,19 @@ class DownloadService : Service() {
     companion object {
         private const val CHANNEL_ID = "manager_downloads"
         private const val NOTIFICATION_ID = 4301
-
         private const val ACTION_PROCESS = "manager.action.PROCESS"
         private const val ACTION_PAUSE = "manager.action.PAUSE"
         private const val ACTION_RESUME = "manager.action.RESUME"
         private const val ACTION_CANCEL = "manager.action.CANCEL"
         private const val EXTRA_ID = "download_id"
 
-        fun process(context: Context) =
-            send(context, ACTION_PROCESS)
-
-        fun pause(context: Context, id: String) =
-            send(context, ACTION_PAUSE, id)
-
-        fun resume(context: Context, id: String) =
-            send(context, ACTION_RESUME, id)
-
-        fun cancel(context: Context, id: String) =
-            send(context, ACTION_CANCEL, id)
+        fun process(context: Context) = send(context, ACTION_PROCESS)
+        fun pause(context: Context, id: String) = send(context, ACTION_PAUSE, id)
+        fun resume(context: Context, id: String) = send(context, ACTION_RESUME, id)
+        fun cancel(context: Context, id: String) = send(context, ACTION_CANCEL, id)
 
         private fun send(context: Context, action: String, id: String? = null) {
-            val intent = Intent(context, DownloadService::class.java)
-                .setAction(action)
+            val intent = Intent(context, DownloadService::class.java).setAction(action)
             if (id != null) intent.putExtra(EXTRA_ID, id)
             ContextCompat.startForegroundService(context, intent)
         }

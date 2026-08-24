@@ -27,7 +27,11 @@ object DownloadRepository {
             _downloads.value = load()
                 .map {
                     if (it.status == DownloadStatus.ACTIVE) {
-                        it.copy(status = DownloadStatus.QUEUED, speedBytesPerSecond = 0L)
+                        it.copy(
+                            status = DownloadStatus.QUEUED,
+                            speedBytesPerSecond = 0L,
+                            detail = null
+                        )
                     } else {
                         it
                     }
@@ -43,16 +47,20 @@ object DownloadRepository {
         url: String,
         suggestedFilename: String? = null,
         cookie: String? = null,
-        userAgent: String? = null
+        userAgent: String? = null,
+        kind: DownloadKind? = null
     ): DownloadTask = synchronized(lock) {
         ensureInitialized()
+        val resolvedKind = kind ?: detectKind(url)
         val filename = sanitizeFilename(
-            suggestedFilename?.takeIf { it.isNotBlank() } ?: filenameFromUrl(url)
+            suggestedFilename?.takeIf { it.isNotBlank() }
+                ?: filenameFromUrl(url, resolvedKind)
         )
         val task = DownloadTask(
             id = UUID.randomUUID().toString(),
             filename = filename,
             url = url,
+            kind = resolvedKind,
             order = _downloads.value.size,
             cookie = cookie,
             userAgent = userAgent
@@ -65,16 +73,28 @@ object DownloadRepository {
     fun find(id: String): DownloadTask? =
         _downloads.value.firstOrNull { it.id == id }
 
-    fun nextQueued(): DownloadTask? =
+    fun queued(limit: Int): List<DownloadTask> =
         _downloads.value
+            .asSequence()
             .filter { it.status == DownloadStatus.QUEUED }
-            .minByOrNull { it.order }
+            .sortedBy { it.order }
+            .take(limit.coerceAtLeast(0))
+            .toList()
+
+    fun nextQueued(): DownloadTask? = queued(1).firstOrNull()
+
+    fun activeCount(): Int =
+        _downloads.value.count { it.status == DownloadStatus.ACTIVE }
+
+    fun hasQueued(): Boolean =
+        _downloads.value.any { it.status == DownloadStatus.QUEUED }
 
     fun pause(id: String) = update(id) { item ->
         if (item.status == DownloadStatus.COMPLETED) item
         else item.copy(
             status = DownloadStatus.PAUSED,
             speedBytesPerSecond = 0L,
+            detail = "En pausa",
             error = null
         )
     }
@@ -84,19 +104,25 @@ object DownloadRepository {
         else item.copy(
             status = DownloadStatus.QUEUED,
             speedBytesPerSecond = 0L,
+            detail = "En cola",
             error = null
         )
     }
 
-    fun markActive(id: String) = update(id) {
-        it.copy(status = DownloadStatus.ACTIVE, error = null)
+    fun markActive(id: String, detail: String? = null) = update(id) {
+        it.copy(
+            status = DownloadStatus.ACTIVE,
+            error = null,
+            detail = detail
+        )
     }
 
     fun markFailed(id: String, message: String) = update(id) {
         it.copy(
             status = DownloadStatus.FAILED,
             speedBytesPerSecond = 0L,
-            error = message.take(240)
+            detail = null,
+            error = message.take(320)
         )
     }
 
@@ -107,6 +133,7 @@ object DownloadRepository {
             totalBytes = if (it.totalBytes > 0) it.totalBytes else bytes,
             speedBytesPerSecond = 0L,
             outputPath = path,
+            detail = "Completada",
             error = null
         )
     }
@@ -115,12 +142,30 @@ object DownloadRepository {
         id: String,
         downloaded: Long,
         total: Long,
-        speed: Long
+        speed: Long,
+        detail: String? = null
     ) = update(id, persist = false) {
         it.copy(
-            bytesDownloaded = downloaded,
+            bytesDownloaded = downloaded.coerceAtLeast(0L),
             totalBytes = total,
-            speedBytesPerSecond = speed.coerceAtLeast(0L)
+            speedBytesPerSecond = speed.coerceAtLeast(0L),
+            detail = detail ?: it.detail
+        )
+    }
+
+    fun updateMetadata(
+        id: String,
+        filename: String? = null,
+        totalBytes: Long? = null,
+        detail: String? = null
+    ) = update(id) { item ->
+        item.copy(
+            filename = filename
+                ?.takeIf { it.isNotBlank() }
+                ?.let(::sanitizeFilename)
+                ?: item.filename,
+            totalBytes = totalBytes?.takeIf { it >= 0 } ?: item.totalBytes,
+            detail = detail ?: item.detail
         )
     }
 
@@ -179,6 +224,7 @@ object DownloadRepository {
                     put("id", item.id)
                     put("filename", item.filename)
                     put("url", item.url)
+                    put("kind", item.kind.name)
                     put("status", item.status.name)
                     put("bytesDownloaded", item.bytesDownloaded)
                     put("totalBytes", item.totalBytes)
@@ -186,6 +232,7 @@ object DownloadRepository {
                     put("order", item.order)
                     put("outputPath", item.outputPath ?: JSONObject.NULL)
                     put("error", item.error ?: JSONObject.NULL)
+                    put("detail", item.detail ?: JSONObject.NULL)
                     put("cookie", item.cookie ?: JSONObject.NULL)
                     put("userAgent", item.userAgent ?: JSONObject.NULL)
                 }
@@ -202,11 +249,15 @@ object DownloadRepository {
             buildList {
                 for (i in 0 until array.length()) {
                     val obj = array.getJSONObject(i)
+                    val url = obj.getString("url")
                     add(
                         DownloadTask(
                             id = obj.getString("id"),
                             filename = obj.getString("filename"),
-                            url = obj.getString("url"),
+                            url = url,
+                            kind = runCatching {
+                                DownloadKind.valueOf(obj.optString("kind", detectKind(url).name))
+                            }.getOrDefault(detectKind(url)),
                             status = runCatching {
                                 DownloadStatus.valueOf(obj.getString("status"))
                             }.getOrDefault(DownloadStatus.QUEUED),
@@ -216,6 +267,7 @@ object DownloadRepository {
                             order = obj.optInt("order", i),
                             outputPath = obj.optNullableString("outputPath"),
                             error = obj.optNullableString("error"),
+                            detail = obj.optNullableString("detail"),
                             cookie = obj.optNullableString("cookie"),
                             userAgent = obj.optNullableString("userAgent")
                         )
@@ -231,11 +283,38 @@ object DownloadRepository {
     private fun queueFile(): File =
         File(appContext.filesDir, FILE_NAME)
 
-    private fun filenameFromUrl(url: String): String {
+    private fun detectKind(url: String): DownloadKind {
+        val lower = url.trim().lowercase()
+        return if (
+            lower.startsWith("magnet:") ||
+            lower.startsWith("content:") ||
+            lower.startsWith("file:") ||
+            lower.substringBefore('?').endsWith(".torrent")
+        ) {
+            DownloadKind.TORRENT
+        } else {
+            DownloadKind.HTTP
+        }
+    }
+
+    private fun filenameFromUrl(url: String, kind: DownloadKind): String {
+        if (url.startsWith("magnet:", ignoreCase = true)) {
+            val display = runCatching {
+                Uri.parse(url).getQueryParameter("dn")
+            }.getOrNull()
+            return display?.takeIf { it.isNotBlank() } ?: "Magnet torrent"
+        }
+
         val candidate = runCatching {
             Uri.parse(url).lastPathSegment
         }.getOrNull()
-        return candidate?.takeIf { it.isNotBlank() } ?: "descarga-${System.currentTimeMillis()}"
+
+        return candidate?.takeIf { it.isNotBlank() }
+            ?: if (kind == DownloadKind.TORRENT) {
+                "Torrent-${System.currentTimeMillis()}"
+            } else {
+                "descarga-${System.currentTimeMillis()}"
+            }
     }
 
     private fun sanitizeFilename(value: String): String {

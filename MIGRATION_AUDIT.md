@@ -1,39 +1,28 @@
-# Auditoría de la versión Replit
+# v0.3 audit / implementation notes
 
-## Hallazgos principales
+## Replaced bottlenecks
 
-La versión importada desde Replit era una aplicación Expo/React Native basada en Expo Router.
+The previous engine used one blocking OkHttp stream and one global single-thread executor. That meant:
+- one file at a time only;
+- no range segmentation;
+- no configurable concurrency;
+- download speed was entirely tied to a single server connection.
 
-### Lo que sí estaba implementado
+v0.3 replaces this with a scheduler, independent transfer workers and a global segment pool.
 
-- Diseño visual de la pantalla principal.
-- Tema claro/oscuro.
-- Diálogo para pegar una URL.
-- Persistencia de una lista mediante AsyncStorage.
-- Botones que cambiaban visualmente entre activo y pausa.
-- Datos demo para simular progreso.
+## HTTP strategy
+1. Probe the server with a one-byte Range request.
+2. If the response is HTTP 206 with a valid total size, choose 1–8 adaptive ranges depending on file size/user setting.
+3. Resume every range independently from its partial file.
+4. Bind resumable partials to a strong ETag or Last-Modified validator and send `If-Range`, so a changed remote object cannot silently corrupt a resumed file.
+5. Merge only after every range is complete.
+6. If range support is unavailable, use the safe single-stream resume path.
 
-### Lo que era simulación
+## Torrent strategy
+FrostWire jlibtorrent 2.0.12.9 was selected because the current release supports Java 17 and Android native binaries for arm, arm64, x86 and x86_64. The base app minSdk remains 26.
 
-- No existía transferencia HTTP de archivos.
-- `addDownload` solo añadía un objeto a una lista.
-- `togglePause` únicamente cambiaba el estado y textos.
-- La velocidad, progreso, tamaño y tiempo restante eran datos estáticos.
-- No existía un servicio de descargas en segundo plano.
-- No existía HTTP Range.
-- No existía cola secuencial real.
-- No existía reordenamiento de prioridad.
-- No existía mini navegador dentro de la navegación principal.
+## Browser blocker
+The blocker intentionally implements the domain-only subset of ABP/EasyList rules that can be interpreted correctly without pretending to support all filter-rule semantics. Conditional rules are skipped rather than overblocked.
 
-## Decisión de migración
-
-Para este producto el núcleo es el trabajo en segundo plano, acceso a archivos, notificaciones, WebView, recuperación de descargas y comportamiento específico de Android. Por eso se migró a Kotlin + Compose en vez de seguir ampliando la maqueta Expo.
-
-La apariencia conserva la paleta original:
-
-- Fondo: `#F4F7FB`
-- Primario: `#146BFF`
-- Éxito: `#17A673`
-- Advertencia: `#D98A21`
-- Error: `#D94B5B`
-- Violeta: `#8064D9`
+## Validation required
+This source package was statically checked for Kotlin syntax, but this environment does not contain an Android SDK/Gradle dependency cache. GitHub Actions is the authoritative compilation test. Do not call v0.3 build-valid until the CI workflow is green.

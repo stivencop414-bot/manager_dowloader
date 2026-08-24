@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Language
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -39,34 +40,45 @@ fun ManagerDownloaderApp() {
                         icon = { Icon(Icons.Default.Language, contentDescription = null) },
                         label = { Text("Navegador") }
                     )
+                    NavigationBarItem(
+                        selected = tab == 2,
+                        onClick = { tab = 2 },
+                        icon = { Icon(Icons.Default.Tune, contentDescription = null) },
+                        label = { Text("Ajustes") }
+                    )
                 }
             }
         ) { padding ->
-            if (tab == 0) {
-                DownloadsScreen(
+            when (tab) {
+                0 -> DownloadsScreen(
                     contentPadding = padding,
                     onAdd = { url, name, cookie, userAgent ->
                         enqueue(context, url, name, cookie, userAgent)
                     }
                 )
-            } else {
-                BrowserScreen(
+
+                1 -> BrowserScreen(
                     contentPadding = padding,
                     onAdd = { url, name, cookie, userAgent ->
                         enqueue(context, url, name, cookie, userAgent)
                     }
+                )
+
+                else -> SettingsScreen(
+                    contentPadding = padding,
+                    onTransferSettingsChanged = { DownloadService.process(context) }
                 )
             }
         }
     }
 }
 
-private fun enqueue(
+fun enqueue(
     context: Context,
     url: String,
-    filename: String?,
-    cookie: String?,
-    userAgent: String?
+    filename: String? = null,
+    cookie: String? = null,
+    userAgent: String? = null
 ) {
     DownloadRepository.add(
         url = url,

@@ -1,63 +1,67 @@
-# Manager Downloader — Native Android
+# Manager Downloader v0.3
 
-Conversión del prototipo de Replit/Expo a Android nativo con Kotlin + Jetpack Compose.
+Native Android download manager built with Kotlin + Jetpack Compose.
 
-## Qué ya es real en esta versión
+## v0.3 engine
 
-- Cola secuencial: se descarga un archivo a la vez.
-- Reordenamiento de pendientes con prioridad manual.
-- Descarga HTTP real con OkHttp.
-- Pausar y continuar conservando el archivo parcial.
-- Reanudación mediante `Range` cuando el servidor lo admite.
-- Si el servidor ignora `Range`, la app reinicia ese archivo de forma segura.
-- Cancelar y quitar elementos de la cola.
-- Persistencia local de la cola y del progreso.
-- Notificación de progreso.
-- Continuación en servicio en primer plano mientras la app se cierra.
-- Mini navegador WebView.
-- Detección de enlaces que disparan una descarga.
-- Transferencia de Cookie y User-Agent del WebView al motor para enlaces autenticados.
-- Tema claro/oscuro inspirado en el diseño original de Replit.
-- GitHub Actions para compilar un APK Debug con cada push a `main`.
+### HTTP acceleration
+- Adaptive multi-range downloads (1–8 segments per file).
+- Server capability probe with `Range: bytes=0-0`.
+- Falls back automatically to a single stream when HTTP Range is unavailable.
+- Each segment has its own partial file so pause/resume does not throw away completed ranges.
+- Resume is validated with strong `ETag` or `Last-Modified` + `If-Range`; if the remote file changed, stale partial data is discarded instead of merged.
+- Larger buffers and concurrent segment workers.
+- Cookies and User-Agent from the embedded browser are forwarded to downloads.
 
-## Estructura
+Multi-range is not a magic bandwidth multiplier: it helps most when a server throttles individual connections or when parallel ranges improve utilization. The app deliberately caps concurrency to avoid making downloads slower or exhausting the phone/network.
 
-- `app/src/main/java/com/managerdownloader/app/data`: cola y persistencia.
-- `app/src/main/java/com/managerdownloader/app/download`: motor HTTP y servicio.
-- `app/src/main/java/com/managerdownloader/app/ui`: Compose y mini navegador.
-- `.github/workflows/build-apk.yml`: build automático.
+### Queue modes
+In **Ajustes > Rendimiento**:
+- **Uno por uno**: only one file/torrent is active.
+- **Simultáneos**: 2–6 transfers can run at the same time.
+- HTTP connections per file are configurable from 1–8.
 
-## Limitaciones conocidas
+### BitTorrent
+Uses FrostWire jlibtorrent/libtorrent 2.0.12.9.
+- Magnet links.
+- Remote `.torrent` URLs.
+- `.torrent` files opened/shared to the app (`application/x-bittorrent`).
+- Torrent progress, peer/seed count and speed in the same queue.
+- Torrents are removed from the libtorrent session when completed so the app behaves as a downloader instead of seeding indefinitely.
 
-### Android 15+ y descargas de muchas horas
+Torrent output is kept under the app-specific `ManagerDownloader/Torrents/<task-id>` directory.
 
-Los servicios `dataSync` en segundo plano tienen un límite acumulado de 6 horas en 24 horas en Android 15+ para apps que apuntan a esas versiones. La app maneja el timeout pausando de forma segura, pero una versión posterior debería incorporar User-Initiated Data Transfer (UIDT) para transferencias extremadamente largas.
+### Embedded browser
+- WebView navigation with progress indication.
+- Safe Browsing enabled.
+- JavaScript + DOM storage for modern download sites.
+- Third-party cookies disabled in the embedded browser.
+- Detects downloads and magnet links.
+- Preserves first-party cookies and User-Agent when sending an HTTP download to the manager.
+- Mixed HTTP content inside HTTPS pages is blocked.
 
-### Carpeta de destino
+### Content blocking
+The blocker works at the WebView request layer and at the Service Worker request layer.
+- Built-in common ad/tracker domains.
+- Periodic EasyList / EasyPrivacy refresh plus a hosts-format ad list for broader network-level coverage.
+- Toggle ads and trackers independently in Settings.
 
-Esta versión guarda archivos en la carpeta de descargas específica de la aplicación:
+No blocker can honestly guarantee that every website will be unable to detect blocked resources. This implementation does not inject anti-anti-adblock spoofing; it focuses on robust request blocking and a user-controlled off switch for sites that break.
 
-`Android/data/com.managerdownloader.app/files/Download/ManagerDownloader`
+## Android / build
+- namespace: `com.managerdownloader.app`
+- minSdk: 26
+- targetSdk: 36
+- compileSdk: 36
+- JDK: 17
+- AGP: 9.3.0
+- Gradle CI: 9.5.0
+- Compose BOM: 2026.06.00
 
-No requiere permisos de almacenamiento. Una siguiente iteración puede añadir selección de carpeta con Storage Access Framework o publicación en `Downloads` mediante MediaStore.
+GitHub Actions builds `ManagerDownloader.apk` and publishes/replaces the `latest-apk` prerelease asset for direct download.
 
-### Enlaces `blob:`
-
-El mini navegador detecta descargas HTTP/HTTPS normales. Los sitios que crean archivos exclusivamente mediante `blob:`/JavaScript requieren un puente específico y todavía no están soportados.
-
-### Release firmado
-
-El workflow de release genera por ahora un APK release sin firma. Antes de distribuir la primera versión oficial hay que configurar una clave permanente mediante GitHub Secrets. No conviene publicar una APK oficial antes de fijar esa firma, porque Android exige la misma clave para actualizar una instalación existente.
-
-## Build
-
-Cada push a `main` ejecuta `Build Android APK`. Al finalizar, descarga el artifact desde la ejecución de GitHub Actions.
-
-## Siguiente fase sugerida
-
-1. Validar el primer APK en un teléfono real.
-2. Añadir carpeta pública configurable.
-3. Implementar UIDT para Android 14+.
-4. Añadir firma de release permanente.
-5. Añadir actualizador desde GitHub Releases.
-6. Añadir captura de enlaces `blob:` cuando sea viable.
+## Important current limitations
+- Downloads are still stored in the app-specific external Downloads directory. Public Downloads via MediaStore/SAF is a future improvement.
+- `blob:` URLs generated entirely inside JavaScript are not captured by `WebViewClient.shouldInterceptRequest`.
+- Long Android 15+ background `dataSync` foreground-service sessions are subject to platform time limits. A future version should migrate long transfers to Android user-initiated data-transfer jobs.
+- Official production distribution still needs a permanent release signing key. The automatic latest APK is a debug-signed test build.
