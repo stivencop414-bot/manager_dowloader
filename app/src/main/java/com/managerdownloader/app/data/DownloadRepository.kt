@@ -1,0 +1,253 @@
+package com.managerdownloader.app.data
+
+import android.content.Context
+import android.net.Uri
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.util.UUID
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+
+object DownloadRepository {
+    private const val FILE_NAME = "download_queue.json"
+    private val lock = Any()
+
+    private lateinit var appContext: Context
+    private var initialized = false
+
+    private val _downloads = MutableStateFlow<List<DownloadTask>>(emptyList())
+    val downloads: StateFlow<List<DownloadTask>> = _downloads.asStateFlow()
+
+    fun initialize(context: Context) {
+        synchronized(lock) {
+            if (initialized) return
+            appContext = context.applicationContext
+            _downloads.value = load()
+                .map {
+                    if (it.status == DownloadStatus.ACTIVE) {
+                        it.copy(status = DownloadStatus.QUEUED, speedBytesPerSecond = 0L)
+                    } else {
+                        it
+                    }
+                }
+                .sortedBy { it.order }
+                .mapIndexed { index, item -> item.copy(order = index) }
+            initialized = true
+            persistLocked()
+        }
+    }
+
+    fun add(
+        url: String,
+        suggestedFilename: String? = null,
+        cookie: String? = null,
+        userAgent: String? = null
+    ): DownloadTask = synchronized(lock) {
+        ensureInitialized()
+        val filename = sanitizeFilename(
+            suggestedFilename?.takeIf { it.isNotBlank() } ?: filenameFromUrl(url)
+        )
+        val task = DownloadTask(
+            id = UUID.randomUUID().toString(),
+            filename = filename,
+            url = url,
+            order = _downloads.value.size,
+            cookie = cookie,
+            userAgent = userAgent
+        )
+        _downloads.value = (_downloads.value + task).sortedBy { it.order }
+        persistLocked()
+        task
+    }
+
+    fun find(id: String): DownloadTask? =
+        _downloads.value.firstOrNull { it.id == id }
+
+    fun nextQueued(): DownloadTask? =
+        _downloads.value
+            .filter { it.status == DownloadStatus.QUEUED }
+            .minByOrNull { it.order }
+
+    fun pause(id: String) = update(id) { item ->
+        if (item.status == DownloadStatus.COMPLETED) item
+        else item.copy(
+            status = DownloadStatus.PAUSED,
+            speedBytesPerSecond = 0L,
+            error = null
+        )
+    }
+
+    fun resume(id: String) = update(id) { item ->
+        if (item.status == DownloadStatus.COMPLETED) item
+        else item.copy(
+            status = DownloadStatus.QUEUED,
+            speedBytesPerSecond = 0L,
+            error = null
+        )
+    }
+
+    fun markActive(id: String) = update(id) {
+        it.copy(status = DownloadStatus.ACTIVE, error = null)
+    }
+
+    fun markFailed(id: String, message: String) = update(id) {
+        it.copy(
+            status = DownloadStatus.FAILED,
+            speedBytesPerSecond = 0L,
+            error = message.take(240)
+        )
+    }
+
+    fun markCompleted(id: String, path: String, bytes: Long) = update(id) {
+        it.copy(
+            status = DownloadStatus.COMPLETED,
+            bytesDownloaded = bytes,
+            totalBytes = if (it.totalBytes > 0) it.totalBytes else bytes,
+            speedBytesPerSecond = 0L,
+            outputPath = path,
+            error = null
+        )
+    }
+
+    fun updateProgress(
+        id: String,
+        downloaded: Long,
+        total: Long,
+        speed: Long
+    ) = update(id, persist = false) {
+        it.copy(
+            bytesDownloaded = downloaded,
+            totalBytes = total,
+            speedBytesPerSecond = speed.coerceAtLeast(0L)
+        )
+    }
+
+    fun flush() = synchronized(lock) {
+        ensureInitialized()
+        persistLocked()
+    }
+
+    fun remove(id: String) = synchronized(lock) {
+        ensureInitialized()
+        _downloads.value = _downloads.value
+            .filterNot { it.id == id }
+            .sortedBy { it.order }
+            .mapIndexed { index, item -> item.copy(order = index) }
+        persistLocked()
+    }
+
+    fun move(id: String, direction: Int) = synchronized(lock) {
+        ensureInitialized()
+        if (direction == 0) return
+        val list = _downloads.value.sortedBy { it.order }.toMutableList()
+        val index = list.indexOfFirst { it.id == id }
+        if (index == -1) return
+        if (list[index].status == DownloadStatus.ACTIVE) return
+
+        val target = (index + direction).coerceIn(0, list.lastIndex)
+        if (target == index) return
+
+        val moving = list.removeAt(index)
+        list.add(target, moving)
+
+        _downloads.value = list.mapIndexed { newIndex, item ->
+            item.copy(order = newIndex)
+        }
+        persistLocked()
+    }
+
+    private fun update(
+        id: String,
+        persist: Boolean = true,
+        transform: (DownloadTask) -> DownloadTask
+    ) = synchronized(lock) {
+        ensureInitialized()
+        _downloads.value = _downloads.value.map {
+            if (it.id == id) transform(it) else it
+        }.sortedBy { it.order }
+        if (persist) persistLocked()
+    }
+
+    private fun persistLocked() {
+        if (!initialized) return
+        val array = JSONArray()
+        _downloads.value.sortedBy { it.order }.forEach { item ->
+            array.put(
+                JSONObject().apply {
+                    put("id", item.id)
+                    put("filename", item.filename)
+                    put("url", item.url)
+                    put("status", item.status.name)
+                    put("bytesDownloaded", item.bytesDownloaded)
+                    put("totalBytes", item.totalBytes)
+                    put("speedBytesPerSecond", item.speedBytesPerSecond)
+                    put("order", item.order)
+                    put("outputPath", item.outputPath ?: JSONObject.NULL)
+                    put("error", item.error ?: JSONObject.NULL)
+                    put("cookie", item.cookie ?: JSONObject.NULL)
+                    put("userAgent", item.userAgent ?: JSONObject.NULL)
+                }
+            )
+        }
+        queueFile().writeText(array.toString())
+    }
+
+    private fun load(): List<DownloadTask> {
+        val file = queueFile()
+        if (!file.exists()) return emptyList()
+        return runCatching {
+            val array = JSONArray(file.readText())
+            buildList {
+                for (i in 0 until array.length()) {
+                    val obj = array.getJSONObject(i)
+                    add(
+                        DownloadTask(
+                            id = obj.getString("id"),
+                            filename = obj.getString("filename"),
+                            url = obj.getString("url"),
+                            status = runCatching {
+                                DownloadStatus.valueOf(obj.getString("status"))
+                            }.getOrDefault(DownloadStatus.QUEUED),
+                            bytesDownloaded = obj.optLong("bytesDownloaded", 0L),
+                            totalBytes = obj.optLong("totalBytes", -1L),
+                            speedBytesPerSecond = 0L,
+                            order = obj.optInt("order", i),
+                            outputPath = obj.optNullableString("outputPath"),
+                            error = obj.optNullableString("error"),
+                            cookie = obj.optNullableString("cookie"),
+                            userAgent = obj.optNullableString("userAgent")
+                        )
+                    )
+                }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    private fun JSONObject.optNullableString(key: String): String? =
+        if (!has(key) || isNull(key)) null else optString(key, null)
+
+    private fun queueFile(): File =
+        File(appContext.filesDir, FILE_NAME)
+
+    private fun filenameFromUrl(url: String): String {
+        val candidate = runCatching {
+            Uri.parse(url).lastPathSegment
+        }.getOrNull()
+        return candidate?.takeIf { it.isNotBlank() } ?: "descarga-${System.currentTimeMillis()}"
+    }
+
+    private fun sanitizeFilename(value: String): String {
+        val clean = value
+            .replace(Regex("""[\\/:*?"<>|]"""), "_")
+            .replace(Regex("""\s+"""), " ")
+            .trim()
+            .take(180)
+        return clean.ifBlank { "descarga-${System.currentTimeMillis()}" }
+    }
+
+    private fun ensureInitialized() {
+        check(initialized) { "DownloadRepository must be initialized first" }
+    }
+}
