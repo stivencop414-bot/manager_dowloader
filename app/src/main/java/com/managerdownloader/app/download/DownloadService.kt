@@ -20,6 +20,7 @@ import com.managerdownloader.app.data.DownloadRepository
 import com.managerdownloader.app.data.DownloadStatus
 import com.managerdownloader.app.data.DownloadTask
 import com.managerdownloader.app.data.SettingsRepository
+import com.managerdownloader.app.data.StorageRepository
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.File
@@ -36,6 +37,8 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicLongArray
 import java.util.concurrent.atomic.AtomicReference
 import okhttp3.Call
+import okhttp3.ConnectionPool
+import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -64,16 +67,23 @@ internal class TransferControl(val id: String) {
 
 class DownloadService : Service() {
     private val transferExecutor = Executors.newCachedThreadPool()
-    private val segmentExecutor = Executors.newFixedThreadPool(12)
+    private val segmentExecutor = Executors.newFixedThreadPool(24)
     private val schedulerLock = Any()
     private val active = ConcurrentHashMap<String, TransferControl>()
     private val shuttingDown = AtomicBoolean(false)
 
+    private val httpDispatcher = Dispatcher().apply {
+        maxRequests = 64
+        maxRequestsPerHost = 16
+    }
+
     private val client = OkHttpClient.Builder()
+        .dispatcher(httpDispatcher)
+        .connectionPool(ConnectionPool(16, 5, java.util.concurrent.TimeUnit.MINUTES))
         .followRedirects(true)
         .followSslRedirects(true)
         .retryOnConnectionFailure(true)
-        .connectTimeout(20, java.util.concurrent.TimeUnit.SECONDS)
+        .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
         .readTimeout(5, java.util.concurrent.TimeUnit.MINUTES)
         .writeTimeout(2, java.util.concurrent.TimeUnit.MINUTES)
         .build()
@@ -267,11 +277,12 @@ class DownloadService : Service() {
 
     private fun chooseSegmentCount(total: Long, requested: Int, rangeSupported: Boolean): Int {
         if (!rangeSupported || total <= 0L) return 1
-        val desired = requested.coerceIn(1, 8)
+        val desired = requested.coerceIn(1, 12)
         return when {
             total < 8L * 1024L * 1024L -> 1
             total < 32L * 1024L * 1024L -> desired.coerceAtMost(2)
             total < 128L * 1024L * 1024L -> desired.coerceAtMost(4)
+            total < 512L * 1024L * 1024L -> desired.coerceAtMost(8)
             else -> desired
         }
     }
@@ -343,7 +354,13 @@ class DownloadService : Service() {
         mergeSegments(task.id, segmentCount, finalFile)
         deleteSegmentFiles(task.id)
 
-        DownloadRepository.markCompleted(task.id, finalFile.absolutePath, finalFile.length())
+        val completedBytes = finalFile.length()
+        val publishedPath = StorageRepository.publishFile(
+            finalFile,
+            task.filename,
+            downloadsDirectory()
+        )
+        DownloadRepository.markCompleted(task.id, publishedPath, completedBytes)
         showCompletedNotification(task.filename)
     }
 
@@ -505,7 +522,13 @@ class DownloadService : Service() {
                 partial.delete()
             }
 
-            DownloadRepository.markCompleted(task.id, finalFile.absolutePath, finalFile.length())
+            val completedBytes = finalFile.length()
+            val publishedPath = StorageRepository.publishFile(
+                finalFile,
+                currentName,
+                downloadsDirectory()
+            )
+            DownloadRepository.markCompleted(task.id, publishedPath, completedBytes)
             runCatching { singleMetaFile(task.id).delete() }
             showCompletedNotification(currentName)
         }

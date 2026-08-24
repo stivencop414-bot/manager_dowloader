@@ -10,8 +10,10 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.result.contract.ActivityResultContracts.OpenDocumentTree
 import com.managerdownloader.app.data.DownloadKind
 import com.managerdownloader.app.data.DownloadRepository
+import com.managerdownloader.app.data.StorageRepository
 import com.managerdownloader.app.download.DownloadService
 import com.managerdownloader.app.ui.ManagerDownloaderApp
 import java.io.File
@@ -20,6 +22,25 @@ import java.util.UUID
 class MainActivity : ComponentActivity() {
     private val notificationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
+    private val folderPickerLauncher =
+        registerForActivityResult(OpenDocumentTree()) { uri ->
+            if (uri != null) StorageRepository.setTreeUri(this, uri)
+            StorageRepository.markPrompted()
+        }
+
+    private val torrentFileLauncher =
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri != null) {
+                runCatching {
+                    contentResolver.takePersistableUriPermission(
+                        uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
+                }
+                enqueueTorrent(uri.toString(), queryDisplayName(uri))
+            }
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -32,7 +53,15 @@ class MainActivity : ComponentActivity() {
         handleIncomingIntent(intent)
 
         setContent {
-            ManagerDownloaderApp()
+            ManagerDownloaderApp(
+                onSelectDownloadFolder = { folderPickerLauncher.launch(null) },
+                onOpenTorrentFile = {
+                    torrentFileLauncher.launch(arrayOf(
+                        "application/x-bittorrent",
+                        "application/octet-stream"
+                    ))
+                }
+            )
         }
     }
 

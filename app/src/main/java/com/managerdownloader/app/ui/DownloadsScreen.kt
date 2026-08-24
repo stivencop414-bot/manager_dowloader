@@ -64,7 +64,8 @@ import com.managerdownloader.app.download.DownloadService
 @Composable
 fun DownloadsScreen(
     contentPadding: PaddingValues,
-    onAdd: (String, String?, String?, String?) -> Unit
+    onAdd: (String, String?, String?, String?) -> Unit,
+    onOpenTorrentFile: () -> Unit
 ) {
     val downloads by DownloadRepository.downloads.collectAsState()
     val settings by SettingsRepository.settings.collectAsState()
@@ -108,13 +109,21 @@ fun DownloadsScreen(
                     )
                 }
 
-                Button(
-                    onClick = { showAddDialog = true },
-                    shape = RoundedCornerShape(14.dp)
-                ) {
-                    Icon(Icons.Default.Add, contentDescription = null)
-                    Spacer(Modifier.width(6.dp))
-                    Text("Nueva")
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    OutlinedButton(
+                        onClick = onOpenTorrentFile,
+                        shape = RoundedCornerShape(14.dp)
+                    ) {
+                        Text(".torrent")
+                    }
+                    Button(
+                        onClick = { showAddDialog = true },
+                        shape = RoundedCornerShape(14.dp)
+                    ) {
+                        Icon(Icons.Default.Add, contentDescription = null)
+                        Spacer(Modifier.width(6.dp))
+                        Text("Nueva")
+                    }
                 }
             }
         }

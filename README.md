@@ -1,67 +1,31 @@
-# Manager Downloader v0.3
+# Manager Downloader v0.4
 
-Native Android download manager built with Kotlin + Jetpack Compose.
+Android nativo con Kotlin + Jetpack Compose.
 
-## v0.3 engine
+## v0.4
 
-### HTTP acceleration
-- Adaptive multi-range downloads (1–8 segments per file).
-- Server capability probe with `Range: bytes=0-0`.
-- Falls back automatically to a single stream when HTTP Range is unavailable.
-- Each segment has its own partial file so pause/resume does not throw away completed ranges.
-- Resume is validated with strong `ETag` or `Last-Modified` + `If-Range`; if the remote file changed, stale partial data is discarded instead of merged.
-- Larger buffers and concurrent segment workers.
-- Cookies and User-Agent from the embedded browser are forwarded to downloads.
+- Nuevo icono de aplicación Manager Downloader.
+- Selector de carpeta mediante Storage Access Framework (SAF): Android otorga acceso persistente solo a la carpeta elegida.
+- Organización automática de archivos terminados en: Videos, Imagenes, Audio, Comprimidos, Programas, Documentos, Torrents y Otros.
+- Los parciales permanecen en almacenamiento específico de la app para mantener la reanudación y las descargas segmentadas; al terminar se publica el archivo en la carpeta elegida.
+- HTTP Range adaptativo hasta 12 conexiones por archivo, con Dispatcher/ConnectionPool de OkHttp ajustados para mayor concurrencia.
+- Modos Uno por uno y Simultáneos.
+- Magnet, torrents web y selector de archivos `.torrent` locales dentro de la app.
+- Detección mejorada en WebView de enlaces directos de video, audio e imagen vistos durante la navegación.
+- Bloqueo de anuncios/rastreadores a nivel de solicitudes WebView + Service Worker, sin inyección de JavaScript anti-anti-adblock.
+- Safe Browsing y bloqueo de contenido mixto siguen activos.
+- Preparado para APK release firmado con clave permanente mediante variables de entorno/GitHub Secrets.
 
-Multi-range is not a magic bandwidth multiplier: it helps most when a server throttles individual connections or when parallel ranges improve utilization. The app deliberately caps concurrency to avoid making downloads slower or exhausting the phone/network.
+## Seguridad y Play Protect
 
-### Queue modes
-In **Ajustes > Rendimiento**:
-- **Uno por uno**: only one file/torrent is active.
-- **Simultáneos**: 2–6 transfers can run at the same time.
-- HTTP connections per file are configurable from 1–8.
+El APK debug distribuido fuera de Google Play puede seguir siendo tratado como una app desconocida. La v0.4 permite compilar un APK `release` firmado de forma estable mediante `release-signed.yml`. Esto mejora la identidad de actualización de la app, pero no garantiza que Play Protect deje de analizar o advertir sobre una app instalada por sideload. Para la experiencia de confianza de Google más fuerte, la distribución por Google Play sigue siendo la vía principal.
 
-### BitTorrent
-Uses FrostWire jlibtorrent/libtorrent 2.0.12.9.
-- Magnet links.
-- Remote `.torrent` URLs.
-- `.torrent` files opened/shared to the app (`application/x-bittorrent`).
-- Torrent progress, peer/seed count and speed in the same queue.
-- Torrents are removed from the libtorrent session when completed so the app behaves as a downloader instead of seeding indefinitely.
+## Almacenamiento Android
 
-Torrent output is kept under the app-specific `ManagerDownloader/Torrents/<task-id>` directory.
+No se solicita `MANAGE_EXTERNAL_STORAGE` ni acceso total al dispositivo. Se usa el selector del sistema (`ACTION_OPEN_DOCUMENT_TREE`) para que el usuario elija una carpeta concreta. En Android 11+ el sistema no permite seleccionar algunas raíces protegidas; se recomienda crear/elegir una subcarpeta como `ManagerDownloader` dentro del proveedor disponible.
 
-### Embedded browser
-- WebView navigation with progress indication.
-- Safe Browsing enabled.
-- JavaScript + DOM storage for modern download sites.
-- Third-party cookies disabled in the embedded browser.
-- Detects downloads and magnet links.
-- Preserves first-party cookies and User-Agent when sending an HTTP download to the manager.
-- Mixed HTTP content inside HTTPS pages is blocked.
+## Limitaciones
 
-### Content blocking
-The blocker works at the WebView request layer and at the Service Worker request layer.
-- Built-in common ad/tracker domains.
-- Periodic EasyList / EasyPrivacy refresh plus a hosts-format ad list for broader network-level coverage.
-- Toggle ads and trackers independently in Settings.
-
-No blocker can honestly guarantee that every website will be unable to detect blocked resources. This implementation does not inject anti-anti-adblock spoofing; it focuses on robust request blocking and a user-controlled off switch for sites that break.
-
-## Android / build
-- namespace: `com.managerdownloader.app`
-- minSdk: 26
-- targetSdk: 36
-- compileSdk: 36
-- JDK: 17
-- AGP: 9.3.0
-- Gradle CI: 9.5.0
-- Compose BOM: 2026.06.00
-
-GitHub Actions builds `ManagerDownloader.apk` and publishes/replaces the `latest-apk` prerelease asset for direct download.
-
-## Important current limitations
-- Downloads are still stored in the app-specific external Downloads directory. Public Downloads via MediaStore/SAF is a future improvement.
-- `blob:` URLs generated entirely inside JavaScript are not captured by `WebViewClient.shouldInterceptRequest`.
-- Long Android 15+ background `dataSync` foreground-service sessions are subject to platform time limits. A future version should migrate long transfers to Android user-initiated data-transfer jobs.
-- Official production distribution still needs a permanent release signing key. The automatic latest APK is a debug-signed test build.
+- La detección multimedia identifica enlaces directos observados por WebView. No intenta saltarse DRM y `blob:` no puede interceptarse mediante `shouldInterceptRequest`.
+- Torrents descargan primero a un directorio temporal accesible por libtorrent y luego se publican en el árbol SAF elegido; para torrents muy grandes esto puede requerir espacio temporal adicional durante el movimiento/copia final.
+- La velocidad real siempre depende del servidor, peers, ISP, Wi-Fi y límites por host. Más segmentos no garantizan más velocidad; por eso el motor sigue siendo adaptativo.

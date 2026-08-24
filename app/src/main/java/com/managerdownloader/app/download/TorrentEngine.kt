@@ -8,6 +8,7 @@ import com.frostwire.jlibtorrent.TorrentInfo
 import com.managerdownloader.app.data.DownloadRepository
 import com.managerdownloader.app.data.DownloadStatus
 import com.managerdownloader.app.data.DownloadTask
+import com.managerdownloader.app.data.StorageRepository
 import java.io.File
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
@@ -100,9 +101,14 @@ internal class TorrentEngine(
                     manager.remove(torrentHandle)
                     handles.remove(task.id)
                     control.torrentHandle = null
+                    val publishedPath = StorageRepository.publishTorrentDirectory(
+                        saveDir,
+                        info.name(),
+                        baseDirectory()
+                    )
                     DownloadRepository.markCompleted(
                         task.id,
-                        saveDir.absolutePath,
+                        publishedPath,
                         total.coerceAtLeast(done)
                     )
                     return

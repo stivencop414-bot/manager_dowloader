@@ -32,11 +32,13 @@ import androidx.compose.ui.unit.sp
 import com.managerdownloader.app.browser.ContentBlocker
 import com.managerdownloader.app.data.QueueMode
 import com.managerdownloader.app.data.SettingsRepository
+import com.managerdownloader.app.data.StorageRepository
 
 @Composable
 fun SettingsScreen(
     contentPadding: PaddingValues,
-    onTransferSettingsChanged: () -> Unit
+    onTransferSettingsChanged: () -> Unit,
+    onSelectDownloadFolder: () -> Unit
 ) {
     val settings by SettingsRepository.settings.collectAsState()
 
@@ -60,6 +62,26 @@ fun SettingsScreen(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             fontSize = 13.sp
         )
+
+        SettingsCard(title = "Almacenamiento y organización") {
+            Text(
+                "Carpeta de destino",
+                fontWeight = FontWeight.SemiBold
+            )
+            Text(
+                StorageRepository.selectedLabel(),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 12.sp
+            )
+            Text(
+                "Los archivos terminados se ordenan automáticamente en Videos, Imágenes, Audio, Comprimidos, Programas, Documentos, Torrents y Otros.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 12.sp
+            )
+            OutlinedButton(onClick = onSelectDownloadFolder) {
+                Text("Elegir / cambiar carpeta")
+            }
+        }
 
         SettingsCard(title = "Modo de cola") {
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -107,8 +129,8 @@ fun SettingsScreen(
             Slider(
                 value = settings.segmentsPerFile.toFloat(),
                 onValueChange = { SettingsRepository.setSegmentsPerFile(it.toInt()) },
-                valueRange = 1f..8f,
-                steps = 6
+                valueRange = 1f..12f,
+                steps = 10
             )
         }
 

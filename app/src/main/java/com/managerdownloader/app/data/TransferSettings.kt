@@ -44,7 +44,7 @@ object SettingsRepository {
                 QueueMode.valueOf(prefs.getString(KEY_QUEUE_MODE, QueueMode.SEQUENTIAL.name)!!)
             }.getOrDefault(QueueMode.SEQUENTIAL),
             maxParallelDownloads = prefs.getInt(KEY_MAX_PARALLEL, 3).coerceIn(2, 6),
-            segmentsPerFile = prefs.getInt(KEY_SEGMENTS, 4).coerceIn(1, 8),
+            segmentsPerFile = prefs.getInt(KEY_SEGMENTS, 6).coerceIn(1, 12),
             adBlockEnabled = prefs.getBoolean(KEY_ADBLOCK, true),
             blockTrackers = prefs.getBoolean(KEY_TRACKERS, true)
         )
@@ -57,7 +57,7 @@ object SettingsRepository {
         update { it.copy(maxParallelDownloads = value.coerceIn(2, 6)) }
 
     fun setSegmentsPerFile(value: Int) =
-        update { it.copy(segmentsPerFile = value.coerceIn(1, 8)) }
+        update { it.copy(segmentsPerFile = value.coerceIn(1, 12)) }
 
     fun setAdBlockEnabled(value: Boolean) = update { it.copy(adBlockEnabled = value) }
 
