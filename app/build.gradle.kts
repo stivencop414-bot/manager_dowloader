@@ -5,7 +5,7 @@ plugins {
 
 android {
     namespace = "com.managerdownloader.app"
-    compileSdk = 37
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.managerdownloader.app"
