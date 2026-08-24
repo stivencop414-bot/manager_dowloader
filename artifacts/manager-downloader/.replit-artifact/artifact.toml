@@ -1,0 +1,24 @@
+kind = "mobile"
+previewPath = "/"
+title = "Manager Downloader"
+description = "Una aplicación móvil nativa Android, moderna y ligera, para administrar descargas con un resumen de actividad, progreso visible y una base preparada para descargas reales en segundo plano, historial y actualizaciones desde versiones publicadas."
+version = "1.0.0"
+id = "artifacts/manager-downloader"
+router = "expo-domain"
+
+[[services]]
+name = "expo"
+ensurePreviewReachable = "/status"
+paths = [ "/" ]
+localPort = 20357
+
+[services.development]
+run = "pnpm --filter @workspace/manager-downloader run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/manager-downloader", "run", "build" ]
+run = [ "pnpm", "--filter", "@workspace/manager-downloader", "run", "serve" ]
+
+[services.env]
+PORT = "20357"
+BASE_PATH = "/"
