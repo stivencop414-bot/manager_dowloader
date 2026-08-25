@@ -15,7 +15,6 @@ import androidx.activity.result.contract.ActivityResultContracts.OpenDocumentTre
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import androidx.lifecycle.lifecycleScope
 import com.managerdownloader.app.data.DownloadKind
 import com.managerdownloader.app.data.DownloadRepository
 import com.managerdownloader.app.data.StorageRepository
@@ -24,8 +23,11 @@ import com.managerdownloader.app.ui.ManagerDownloaderApp
 import com.managerdownloader.app.youtube.YouTubeUrlParser
 import java.io.File
 import java.util.UUID
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
     private var incomingBrowserUrl by mutableStateOf<String?>(null)
@@ -46,23 +48,23 @@ class MainActivity : ComponentActivity() {
             pendingMoveTaskId = null
             if (uri == null || taskId == null) return@registerForActivityResult
             val task = DownloadRepository.find(taskId) ?: return@registerForActivityResult
-            lifecycleScope.launch(Dispatchers.IO) {
-                runCatching { StorageRepository.moveCompletedFile(this@MainActivity, task, uri) }
-                    .onSuccess { newPath ->
-                        DownloadRepository.updateOutputPath(taskId, newPath)
-                        launch(Dispatchers.Main) {
-                            Toast.makeText(this@MainActivity, "Archivo movido", Toast.LENGTH_SHORT).show()
-                        }
+            val appContext = applicationContext
+            fileOpsScope.launch {
+                val result = runCatching { StorageRepository.moveCompletedFile(appContext, task, uri) }
+                result.onSuccess { newPath ->
+                    DownloadRepository.updateOutputPath(taskId, newPath)
+                }
+                withContext(Dispatchers.Main) {
+                    result.onSuccess {
+                        Toast.makeText(appContext, "Archivo movido", Toast.LENGTH_SHORT).show()
+                    }.onFailure { error ->
+                        Toast.makeText(
+                            appContext,
+                            error.message ?: "No se pudo mover el archivo",
+                            Toast.LENGTH_LONG
+                        ).show()
                     }
-                    .onFailure { error ->
-                        launch(Dispatchers.Main) {
-                            Toast.makeText(
-                                this@MainActivity,
-                                error.message ?: "No se pudo mover el archivo",
-                                Toast.LENGTH_LONG
-                            ).show()
-                        }
-                    }
+                }
             }
         }
 
@@ -177,4 +179,11 @@ class MainActivity : ComponentActivity() {
     }.getOrNull()
 
     private fun magnetName(uri: Uri): String? = uri.getQueryParameter("dn")
+
+    companion object {
+        // File moves must outlive Activity recreation; SAF grants and repository state are
+        // application-scoped, so this scope is intentionally not tied to lifecycleScope.
+        private val fileOpsScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    }
+
 }

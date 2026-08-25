@@ -256,7 +256,7 @@ fun SettingsScreen(
             )
             ToggleRow(
                 title = "Detector de medios",
-                subtitle = "Detecta únicamente video y audio. Omite imágenes, iconos y recursos decorativos para reducir falsos positivos y consumo de memoria.",
+                subtitle = "Detecta archivos directos y manifiestos HLS/DASH con un sniffer acotado. Omite imágenes y fragmentos .ts/.m4s; los blob se muestran solo como diagnóstico.",
                 checked = settings.mediaSnifferEnabled,
                 onCheckedChange = SettingsRepository::setMediaSnifferEnabled
             )

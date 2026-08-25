@@ -208,12 +208,17 @@ object StorageRepository {
             value.startsWith("content://", true) -> Uri.parse(value)
             value.startsWith("file://", true) -> {
                 val file = File(Uri.parse(value).path ?: return null)
-                FileProvider.getUriForFile(context, "${context.packageName}.files", file)
+                if (!isManagedLocalFile(context, file)) return null
+                runCatching {
+                    FileProvider.getUriForFile(context, "${context.packageName}.files", file)
+                }.getOrNull()
             }
             else -> {
                 val file = File(value)
-                if (!file.exists() || file.isDirectory) return null
-                FileProvider.getUriForFile(context, "${context.packageName}.files", file)
+                if (!file.exists() || file.isDirectory || !isManagedLocalFile(context, file)) return null
+                runCatching {
+                    FileProvider.getUriForFile(context, "${context.packageName}.files", file)
+                }.getOrNull()
             }
         }
     }
@@ -233,7 +238,9 @@ object StorageRepository {
             DocumentFile.fromSingleUri(context, Uri.parse(value))?.delete() == true
         } else {
             val path = if (value.startsWith("file://", true)) Uri.parse(value).path else value
-            File(path ?: return@runCatching false).deleteRecursively()
+            val file = File(path ?: return@runCatching false)
+            if (!isManagedLocalFile(context, file)) return@runCatching false
+            file.deleteRecursively()
         }
     }.getOrDefault(false)
 
@@ -252,16 +259,30 @@ object StorageRepository {
         }
     }
 
-    private fun findOrCreateDirectory(parent: DocumentFile, name: String): DocumentFile =
-        parent.findFile(name)?.takeIf { it.isDirectory }
-            ?: parent.createDirectory(name)
-            ?: throw IOException("No se pudo crear la carpeta $name")
+    private fun existingChildren(parent: DocumentFile): Map<String, DocumentFile> =
+        parent.listFiles()
+            .mapNotNull { child -> child.name?.let { it to child } }
+            .toMap()
+
+    private fun existingNames(parent: DocumentFile): HashSet<String> =
+        parent.listFiles()
+            .mapNotNullTo(HashSet()) { it.name }
+
+    private fun findOrCreateDirectory(parent: DocumentFile, name: String): DocumentFile {
+        val safe = safeName(name)
+        val children = existingChildren(parent)
+        return children[safe]?.takeIf { it.isDirectory }
+            ?: parent.createDirectory(safe)
+            ?: throw IOException("No se pudo crear la carpeta $safe")
+    }
 
     private fun createUniqueDirectory(parent: DocumentFile, name: String): DocumentFile {
-        var candidate = name
+        val safe = safeName(name)
+        val names = existingNames(parent)
+        var candidate = safe
         var index = 1
-        while (parent.findFile(candidate) != null) {
-            candidate = "$name ($index)"
+        while (candidate in names) {
+            candidate = "$safe ($index)"
             index++
         }
         return parent.createDirectory(candidate)
@@ -270,12 +291,13 @@ object StorageRepository {
 
     private fun createUniqueFile(parent: DocumentFile, filename: String): DocumentFile {
         val safe = safeName(filename)
+        val names = existingNames(parent)
         val dot = safe.lastIndexOf('.')
         val base = if (dot > 0) safe.substring(0, dot) else safe
         val ext = if (dot > 0) safe.substring(dot) else ""
         var candidate = safe
         var index = 1
-        while (parent.findFile(candidate) != null) {
+        while (candidate in names) {
             candidate = "$base ($index)$ext"
             index++
         }
@@ -305,18 +327,43 @@ object StorageRepository {
     }
 
     private fun uniqueDirectory(dir: File, name: String): File {
-        var candidate = File(dir, name)
+        val safe = safeName(name)
+        var candidate = File(dir, safe)
         var index = 1
         while (candidate.exists()) {
-            candidate = File(dir, "$name ($index)")
+            candidate = File(dir, "$safe ($index)")
             index++
         }
         return candidate
     }
 
-    private fun safeName(value: String): String = value
-        .replace(Regex("""[\\/:*?\"<>|]"""), "_")
-        .trim()
-        .take(180)
-        .ifBlank { "Descarga" }
+    private fun isManagedLocalFile(context: Context, file: File): Boolean {
+        val candidate = runCatching { file.canonicalFile }.getOrNull() ?: return false
+        val roots = buildList {
+            add(File(context.filesDir, "downloads/ManagerDownloader"))
+            context.getExternalFilesDir(android.os.Environment.DIRECTORY_DOWNLOADS)
+                ?.let { add(File(it, "ManagerDownloader")) }
+        }
+        return roots.any { root ->
+            val canonicalRoot = runCatching { root.canonicalFile }.getOrNull() ?: return@any false
+            candidate.path == canonicalRoot.path ||
+                candidate.path.startsWith(canonicalRoot.path + File.separator)
+        }
+    }
+
+    private fun safeName(value: String): String {
+        var clean = value
+            .replace("\u0000", "")
+            .replace(Regex("""[\\/:*?"<>|]"""), "_")
+            .replace(Regex("""\s+"""), " ")
+            .trim()
+            .trim(' ', '.')
+            .take(180)
+            .trim(' ', '.')
+        if (clean.isBlank() || clean == "." || clean == "..") {
+            clean = "Descarga"
+        }
+        return clean
+    }
+
 }

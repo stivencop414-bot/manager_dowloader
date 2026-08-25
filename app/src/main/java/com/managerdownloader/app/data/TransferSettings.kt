@@ -83,7 +83,7 @@ object SettingsRepository {
         val prefs = appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         _settings.value = TransferSettings(
             queueMode = runCatching {
-                QueueMode.valueOf(prefs.getString(KEY_QUEUE_MODE, QueueMode.SEQUENTIAL.name)!!)
+                QueueMode.valueOf(prefs.getString(KEY_QUEUE_MODE, QueueMode.SEQUENTIAL.name) ?: QueueMode.SEQUENTIAL.name)
             }.getOrDefault(QueueMode.SEQUENTIAL),
             maxParallelDownloads = prefs.getInt(KEY_MAX_PARALLEL, 3).coerceIn(2, 6),
             segmentsPerFile = prefs.getInt(KEY_SEGMENTS, 6).coerceIn(1, 8),
@@ -92,18 +92,18 @@ object SettingsRepository {
             adBlockEnabled = prefs.getBoolean(KEY_ADBLOCK, true),
             blockTrackers = prefs.getBoolean(KEY_TRACKERS, true),
             adBlockMode = runCatching {
-                AdBlockMode.valueOf(prefs.getString(KEY_ADBLOCK_MODE, AdBlockMode.STANDARD.name)!!)
+                AdBlockMode.valueOf(prefs.getString(KEY_ADBLOCK_MODE, AdBlockMode.STANDARD.name) ?: AdBlockMode.STANDARD.name)
             }.getOrDefault(AdBlockMode.STANDARD),
             wifiOnly = prefs.getBoolean(KEY_WIFI_ONLY, false),
             bandwidthLimitMbps = prefs.getInt(KEY_BANDWIDTH, 0).coerceIn(0, 100),
             searchEngine = runCatching {
-                SearchEngine.valueOf(prefs.getString(KEY_SEARCH_ENGINE, SearchEngine.DUCKDUCKGO.name)!!)
+                SearchEngine.valueOf(prefs.getString(KEY_SEARCH_ENGINE, SearchEngine.DUCKDUCKGO.name) ?: SearchEngine.DUCKDUCKGO.name)
             }.getOrDefault(SearchEngine.DUCKDUCKGO),
             chromeCompatUserAgent = prefs.getBoolean(KEY_CHROME_UA, true),
             thirdPartyCookies = prefs.getBoolean(KEY_THIRD_PARTY_COOKIES, false),
             mediaSnifferEnabled = prefs.getBoolean(KEY_MEDIA_SNIFFER, true),
             themeMode = runCatching {
-                ThemeMode.valueOf(prefs.getString(KEY_THEME_MODE, ThemeMode.SYSTEM.name)!!)
+                ThemeMode.valueOf(prefs.getString(KEY_THEME_MODE, ThemeMode.SYSTEM.name) ?: ThemeMode.SYSTEM.name)
             }.getOrDefault(ThemeMode.SYSTEM)
         )
         initialized = true
@@ -144,7 +144,7 @@ object SettingsRepository {
     fun setThemeMode(value: ThemeMode) = update { it.copy(themeMode = value) }
 
     private fun update(transform: (TransferSettings) -> TransferSettings) {
-        check(initialized) { "SettingsRepository must be initialized first" }
+        if (!initialized) return
         val next = transform(_settings.value)
         _settings.value = next
         appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)

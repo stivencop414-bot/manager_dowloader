@@ -1,6 +1,8 @@
 package com.managerdownloader.app.ui
 
 import android.content.Context
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Language
@@ -19,7 +21,9 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import com.managerdownloader.app.data.DownloadRepository
 import com.managerdownloader.app.data.StorageRepository
@@ -36,7 +40,8 @@ fun ManagerDownloaderApp(
 ) {
     val settings by SettingsRepository.settings.collectAsState()
     ManagerTheme(settings.themeMode) {
-        var tab by remember { mutableIntStateOf(0) }
+        var tab by rememberSaveable { mutableIntStateOf(0) }
+        var browserLastUrl by rememberSaveable { mutableStateOf<String?>(null) }
         LaunchedEffect(incomingBrowserUrl) {
             if (incomingBrowserUrl != null) tab = 1
         }
@@ -68,30 +73,46 @@ fun ManagerDownloaderApp(
                 }
             }
         ) { padding ->
-            when (tab) {
-                0 -> DownloadsScreen(
+            Box(modifier = Modifier.fillMaxSize()) {
+                // Keep the browser composed across tab changes. This preserves WebView history,
+                // session state and renderer resources instead of destroying/recreating Chromium.
+                BrowserScreen(
                     contentPadding = padding,
-                    onAdd = { url, name, cookie, userAgent, expectedSha256 ->
-                        enqueue(context, url, name, cookie, userAgent, expectedSha256)
+                    onAdd = { url, name, cookie, userAgent, referer, originalSourceUrl, sourceFormatId ->
+                        enqueue(
+                            context = context,
+                            url = url,
+                            filename = name,
+                            cookie = cookie,
+                            userAgent = userAgent,
+                            referer = referer,
+                            originalSourceUrl = originalSourceUrl,
+                            sourceFormatId = sourceFormatId
+                        )
                     },
-                    onOpenTorrentFile = onOpenTorrentFile,
-                    onMoveCompleted = onMoveCompleted
-                )
-
-                1 -> BrowserScreen(
-                    contentPadding = padding,
-                    onAdd = { url, name, cookie, userAgent ->
-                        enqueue(context, url, name, cookie, userAgent)
-                    },
+                    onAddBatch = { requests -> enqueueBatch(context, requests) },
+                    initialUrl = browserLastUrl,
                     incomingUrl = incomingBrowserUrl,
+                    isVisible = tab == 1,
+                    onCurrentUrlChanged = { browserLastUrl = it },
                     onIncomingUrlConsumed = onIncomingBrowserUrlConsumed
                 )
 
-                else -> SettingsScreen(
-                    contentPadding = padding,
-                    onTransferSettingsChanged = { DownloadService.refreshSettings(context) },
-                    onSelectDownloadFolder = onSelectDownloadFolder
-                )
+                when (tab) {
+                    0 -> DownloadsScreen(
+                        contentPadding = padding,
+                        onAdd = { url, name, cookie, userAgent, expectedSha256 ->
+                            enqueue(context, url, name, cookie, userAgent, expectedSha256)
+                        },
+                        onOpenTorrentFile = onOpenTorrentFile,
+                        onMoveCompleted = onMoveCompleted
+                    )
+                    2 -> SettingsScreen(
+                        contentPadding = padding,
+                        onTransferSettingsChanged = { DownloadService.refreshSettings(context) },
+                        onSelectDownloadFolder = onSelectDownloadFolder
+                    )
+                }
             }
         }
 
@@ -130,14 +151,36 @@ fun enqueue(
     filename: String? = null,
     cookie: String? = null,
     userAgent: String? = null,
-    expectedSha256: String? = null
+    expectedSha256: String? = null,
+    referer: String? = null,
+    originalSourceUrl: String? = null,
+    sourceFormatId: String? = null
 ) {
     DownloadRepository.add(
         url = url,
         suggestedFilename = filename,
         cookie = cookie,
         userAgent = userAgent,
-        expectedSha256 = expectedSha256
+        referer = referer,
+        expectedSha256 = expectedSha256,
+        originalSourceUrl = originalSourceUrl,
+        sourceFormatId = sourceFormatId
     )
     DownloadService.process(context)
 }
+fun enqueueBatch(context: Context, requests: List<BrowserDownloadRequest>) {
+    if (requests.isEmpty()) return
+    requests.distinctBy { it.url }.forEach { request ->
+        DownloadRepository.add(
+            url = request.url,
+            suggestedFilename = request.filename,
+            cookie = request.cookie,
+            userAgent = request.userAgent,
+            referer = request.referer,
+            originalSourceUrl = request.originalSourceUrl,
+            sourceFormatId = request.sourceFormatId
+        )
+    }
+    DownloadService.process(context)
+}
+

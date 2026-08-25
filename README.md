@@ -1,7 +1,15 @@
 # Manager Downloader
 
-## v0.7.1
+## v0.7.3
 Administrador de descargas Android nativo en Kotlin + Jetpack Compose.
+
+### Navegador estable
+- WebView alojado en un contenedor seguro y recuperación ante `onRenderProcessGone`.
+- Sniffer temporal para medios dinámicos, con límites para evitar saturación.
+- Detección separada de archivos directos, HLS/DASH y blob.
+- Descarga múltiple de archivos directos detectados.
+- Cookie, User-Agent y Referer conservados al enviar descargas desde el navegador.
+
 
 ### Rendimiento
 - HTTP/HTTPS con Range y hasta 8 conexiones adaptativas por archivo.

@@ -2,9 +2,13 @@ package com.managerdownloader.app.download
 
 import android.content.Context
 import android.net.Uri
+import com.frostwire.jlibtorrent.AlertListener
 import com.frostwire.jlibtorrent.SessionManager
 import com.frostwire.jlibtorrent.TorrentHandle
 import com.frostwire.jlibtorrent.TorrentInfo
+import com.frostwire.jlibtorrent.alerts.Alert
+import com.frostwire.jlibtorrent.alerts.AlertType
+import com.frostwire.jlibtorrent.alerts.CacheFlushedAlert
 import com.managerdownloader.app.data.DownloadRepository
 import com.managerdownloader.app.data.DownloadStatus
 import com.managerdownloader.app.data.DownloadTask
@@ -13,6 +17,10 @@ import com.managerdownloader.app.data.SettingsRepository
 import java.io.File
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -26,6 +34,7 @@ internal class TorrentEngine(
     private val manager = SessionManager()
     private val started = AtomicBoolean(false)
     private val handles = ConcurrentHashMap<String, TorrentHandle>()
+    private val magnetExecutor = Executors.newCachedThreadPool()
 
     @Synchronized
     fun ensureStarted(maxActive: Int) {
@@ -101,8 +110,7 @@ internal class TorrentEngine(
                 )
 
                 if (status.isFinished()) {
-                    torrentHandle.pause()
-                    manager.remove(torrentHandle)
+                    flushAndRemove(torrentHandle, 4_000L)
                     handles.remove(task.id)
                     control.torrentHandle = null
                     val publishedPath = StorageRepository.publishTorrentDirectory(
@@ -122,7 +130,7 @@ internal class TorrentEngine(
             }
         } finally {
             if (control.deleteOnStop.get()) {
-                runCatching { manager.remove(torrentHandle) }
+                flushAndRemove(torrentHandle, 1_500L)
                 handles.remove(task.id)
                 deleteRecursivelySafe(saveDir)
             }
@@ -150,11 +158,12 @@ internal class TorrentEngine(
 
     fun cancel(id: String) {
         val handle = handles.remove(id)
-        if (handle != null) runCatching { manager.remove(handle) }
+        if (handle != null) flushAndRemove(handle, 1_500L)
         deleteRecursivelySafe(torrentDirectory(id))
     }
 
     fun stopAsync() {
+        magnetExecutor.shutdownNow()
         if (!started.get()) return
         Thread({ runCatching { manager.stop() } }, "torrent-session-stop").start()
     }
@@ -164,7 +173,7 @@ internal class TorrentEngine(
         return when {
             source.startsWith("magnet:", ignoreCase = true) -> {
                 DownloadRepository.updateMetadata(task.id, detail = "Obteniendo metadatos del magnet…")
-                val metadata = manager.fetchMagnet(source, 60, context.cacheDir)
+                val metadata = fetchMagnetCancelable(source, control)
                     ?: throw IOException("No se pudieron obtener los metadatos del magnet")
                 if (control.stopped.get()) throw IOException("Transferencia detenida")
                 TorrentInfo(metadata)
@@ -189,6 +198,7 @@ internal class TorrentEngine(
                     .get()
                 task.cookie?.takeIf { it.isNotBlank() }?.let { requestBuilder.header("Cookie", it) }
                 task.userAgent?.takeIf { it.isNotBlank() }?.let { requestBuilder.header("User-Agent", it) }
+                task.referer?.takeIf { it.isNotBlank() }?.let { requestBuilder.header("Referer", it) }
                 val call = httpClient.newCall(requestBuilder.build())
                 control.calls.add(call)
                 try {
@@ -202,6 +212,51 @@ internal class TorrentEngine(
                     control.calls.remove(call)
                 }
             }
+        }
+    }
+
+    private fun fetchMagnetCancelable(source: String, control: TransferControl): ByteArray? {
+        val future = magnetExecutor.submit<ByteArray?> {
+            manager.fetchMagnet(source, 60, context.cacheDir)
+        }
+        try {
+            while (!control.stopped.get()) {
+                try {
+                    return future.get(250L, TimeUnit.MILLISECONDS)
+                } catch (_: TimeoutException) {
+                    // Poll cancellation so Pause/Cancel never waits for fetchMagnet's full timeout.
+                }
+            }
+            future.cancel(true)
+            throw IOException("Transferencia detenida")
+        } finally {
+            if (control.stopped.get()) future.cancel(true)
+        }
+    }
+
+    private fun flushAndRemove(handle: TorrentHandle, timeoutMs: Long) {
+        val infoHash = runCatching { handle.infoHash().toString() }.getOrNull()
+        val flushed = CountDownLatch(1)
+        val listener = object : AlertListener {
+            override fun types(): IntArray = intArrayOf(AlertType.CACHE_FLUSHED.swig())
+
+            override fun alert(alert: Alert<*>) {
+                val cacheAlert = alert as? CacheFlushedAlert ?: return
+                val matches = infoHash == null || runCatching {
+                    cacheAlert.handle().infoHash().toString() == infoHash
+                }.getOrDefault(false)
+                if (matches) flushed.countDown()
+            }
+        }
+
+        runCatching { manager.addListener(listener) }
+        try {
+            runCatching { handle.pause() }
+            runCatching { handle.flushCache() }
+            runCatching { flushed.await(timeoutMs.coerceAtLeast(250L), TimeUnit.MILLISECONDS) }
+        } finally {
+            runCatching { manager.removeListener(listener) }
+            runCatching { manager.remove(handle) }
         }
     }
 

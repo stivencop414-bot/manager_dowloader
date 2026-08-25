@@ -28,6 +28,9 @@ object ContentBlocker {
     private const val HOSTS_CACHE = "stevenblack_hosts.txt"
     private const val PRIVACY_CACHE = "easyprivacy_hosts.txt"
     private const val REFRESH_INTERVAL_MS = 24L * 60L * 60L * 1000L
+    private const val MAX_EASYLIST_HOSTS = 45_000
+    private const val MAX_PRIVACY_HOSTS = 30_000
+    private const val MAX_STRICT_HOSTS = 20_000
 
     private const val EASYLIST_URL = "https://easylist.to/easylist/easylist.txt"
     private const val STEVENBLACK_HOSTS_URL = "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
@@ -43,10 +46,16 @@ object ContentBlocker {
     private var trackerHosts: Set<String> = emptySet()
 
     @Volatile
+    private var strictHosts: Set<String> = emptySet()
+
+    @Volatile
     private var allowedSites: Set<String> = emptySet()
 
     @Volatile
     private var activePageHost: String? = null
+
+    @Volatile
+    private var emergencyBypass = false
 
     private val blocked = AtomicLong(0L)
     private val executor = Executors.newSingleThreadExecutor()
@@ -64,10 +73,18 @@ object ContentBlocker {
             ?.map { it.lowercase(Locale.US).trimEnd('.') }
             ?.toSet()
             .orEmpty()
-        adHosts = DEFAULT_AD_HOSTS + readCache(AD_CACHE) + readCache(HOSTS_CACHE)
-        trackerHosts = DEFAULT_TRACKER_HOSTS + readCache(PRIVACY_CACHE)
+        // Keep Application.onCreate light. Large host caches can contain tens of thousands of
+        // entries; parsing them on the main thread can delay startup or contribute to ANRs.
+        adHosts = DEFAULT_AD_HOSTS
+        trackerHosts = DEFAULT_TRACKER_HOSTS
+        strictHosts = emptySet()
         initialized = true
-        refreshIfStale()
+        executor.execute {
+            adHosts = DEFAULT_AD_HOSTS + readCache(AD_CACHE, MAX_EASYLIST_HOSTS)
+            trackerHosts = DEFAULT_TRACKER_HOSTS + readCache(PRIVACY_CACHE, MAX_PRIVACY_HOSTS)
+            strictHosts = readCache(HOSTS_CACHE, MAX_STRICT_HOSTS)
+            refreshIfStale()
+        }
     }
 
     fun refreshIfStale(force: Boolean = false) {
@@ -77,16 +94,21 @@ object ContentBlocker {
         if (!force && System.currentTimeMillis() - updatedAt < REFRESH_INTERVAL_MS) return
 
         executor.execute {
-            val downloadedEasyList = downloadRules(EASYLIST_URL)
-            val downloadedHosts = downloadRules(STEVENBLACK_HOSTS_URL)
-            val downloadedPrivacy = downloadRules(EASYPRIVACY_URL)
+            val downloadedEasyList = downloadRules(EASYLIST_URL, MAX_EASYLIST_HOSTS)
+            val downloadedPrivacy = downloadRules(EASYPRIVACY_URL, MAX_PRIVACY_HOSTS)
+            val downloadedHosts = if (SettingsRepository.settings.value.adBlockMode == AdBlockMode.STRICT) {
+                downloadRules(STEVENBLACK_HOSTS_URL, MAX_STRICT_HOSTS)
+            } else {
+                emptySet()
+            }
 
-            val easyList = downloadedEasyList.ifEmpty { readCache(AD_CACHE) }
-            val hosts = downloadedHosts.ifEmpty { readCache(HOSTS_CACHE) }
-            val privacy = downloadedPrivacy.ifEmpty { readCache(PRIVACY_CACHE) }
+            val easyList = downloadedEasyList.ifEmpty { readCache(AD_CACHE, MAX_EASYLIST_HOSTS) }
+            val privacy = downloadedPrivacy.ifEmpty { readCache(PRIVACY_CACHE, MAX_PRIVACY_HOSTS) }
+            val hosts = downloadedHosts.ifEmpty { readCache(HOSTS_CACHE, MAX_STRICT_HOSTS) }
 
-            adHosts = DEFAULT_AD_HOSTS + easyList + hosts
+            adHosts = DEFAULT_AD_HOSTS + easyList
             trackerHosts = DEFAULT_TRACKER_HOSTS + privacy
+            strictHosts = hosts
 
             if (downloadedEasyList.isNotEmpty()) writeCache(AD_CACHE, downloadedEasyList)
             if (downloadedHosts.isNotEmpty()) writeCache(HOSTS_CACHE, downloadedHosts)
@@ -100,6 +122,11 @@ object ContentBlocker {
 
     fun setActivePage(url: String?) {
         activePageHost = hostOf(url)
+    }
+
+    /** Temporary browser crash-recovery bypass; not persisted to the user's allow-list. */
+    fun setEmergencyBypass(enabled: Boolean) {
+        emergencyBypass = enabled
     }
 
     fun isCurrentSiteAllowed(url: String?): Boolean {
@@ -125,7 +152,7 @@ object ContentBlocker {
         isMainFrame: Boolean = false,
         method: String? = "GET"
     ): Boolean {
-        if (!initialized || url.isNullOrBlank()) return false
+        if (!initialized || url.isNullOrBlank() || emergencyBypass) return false
         val settings = SettingsRepository.settings.value
         if (!settings.adBlockEnabled) return false
 
@@ -144,7 +171,8 @@ object ContentBlocker {
         if (matchesHost(host, ESSENTIAL_COMPAT_HOSTS)) return false
 
         val matched = matchesHost(host, adHosts) ||
-            (settings.blockTrackers && matchesHost(host, trackerHosts))
+            (settings.blockTrackers && matchesHost(host, trackerHosts)) ||
+            (settings.adBlockMode == AdBlockMode.STRICT && matchesHost(host, strictHosts))
         if (!matched) return false
 
         if (settings.adBlockMode == AdBlockMode.STANDARD && topHost != null && sameSite(host, topHost)) {
@@ -164,7 +192,7 @@ object ContentBlocker {
         ByteArrayInputStream(ByteArray(0))
     )
 
-    fun ruleCount(): Int = adHosts.size + trackerHosts.size
+    fun ruleCount(): Int = adHosts.size + trackerHosts.size + strictHosts.size
 
     fun blockedCount(): Long = blocked.get()
 
@@ -189,25 +217,25 @@ object ContentBlocker {
         return false
     }
 
-    private fun downloadRules(url: String): Set<String> = runCatching {
+    private fun downloadRules(url: String, limit: Int): Set<String> = runCatching {
         val request = Request.Builder()
             .url(url)
-            .header("User-Agent", "ManagerDownloader/0.6")
+            .header("User-Agent", "ManagerDownloader/0.7.3")
             .get()
             .build()
         client.newCall(request).execute().use { response ->
             if (!response.isSuccessful) return@use emptySet<String>()
-            parseHosts(response.body?.string().orEmpty())
+            val body = response.body ?: return@use emptySet<String>()
+            body.charStream().buffered().useLines { lines -> parseHosts(lines, limit) }
         }
     }.getOrDefault(emptySet<String>())
 
-    /** Extract the host-based subset of EasyList/EasyPrivacy/hosts sources. */
-    private fun parseHosts(text: String): Set<String> = buildSet {
-        text.lineSequence().forEach { raw ->
+    /** Extract only host rules and stop at a mobile-safe cap to avoid large transient strings/OOMs. */
+    private fun parseHosts(lines: Sequence<String>, limit: Int): Set<String> = buildSet {
+        for (raw in lines) {
+            if (size >= limit) break
             val line = raw.trim()
-            if (line.isBlank() || line.startsWith("!") || line.startsWith("[") || line.startsWith("@@")) {
-                return@forEach
-            }
+            if (line.isBlank() || line.startsWith("!") || line.startsWith("[") || line.startsWith("@@")) continue
 
             if (line.startsWith("||")) {
                 val options = line.substringAfter('$', "")
@@ -217,7 +245,7 @@ object ContentBlocker {
                     options.contains("csp", true) ||
                     options.contains("badfilter", true) ||
                     options.contains("removeparam", true)
-                ) return@forEach
+                ) continue
 
                 val rulePart = line.substringBefore('$')
                 val domain = rulePart
@@ -227,7 +255,7 @@ object ContentBlocker {
                     .trim()
                     .lowercase(Locale.US)
                 if (isDomain(domain)) add(domain)
-                return@forEach
+                continue
             }
 
             if (line.startsWith("0.0.0.0 ") || line.startsWith("127.0.0.1 ")) {
@@ -247,19 +275,25 @@ object ContentBlocker {
                     part.lastOrNull()?.isLetterOrDigit() == true
             }
 
-    private fun readCache(name: String): Set<String> = runCatching {
+    private fun readCache(name: String, limit: Int): Set<String> = runCatching {
         val file = java.io.File(appContext.filesDir, name)
         if (!file.exists()) return@runCatching emptySet<String>()
-        file.readLines()
-            .map { it.trim().lowercase(Locale.US) }
-            .filter(::isDomain)
-            .toSet()
+        file.useLines { lines ->
+            lines.asSequence()
+                .map { it.trim().lowercase(Locale.US) }
+                .filter(::isDomain)
+                .take(limit)
+                .toSet()
+        }
     }.getOrDefault(emptySet<String>())
 
     private fun writeCache(name: String, hosts: Set<String>) {
         runCatching {
-            java.io.File(appContext.filesDir, name)
-                .writeText(hosts.sorted().joinToString("\n"))
+            java.io.File(appContext.filesDir, name).bufferedWriter().use { writer ->
+                hosts.asSequence().sorted().forEach { host ->
+                    writer.append(host).append('\n')
+                }
+            }
         }
     }
 

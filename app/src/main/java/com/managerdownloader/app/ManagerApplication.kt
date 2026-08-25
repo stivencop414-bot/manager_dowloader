@@ -12,6 +12,6 @@ class ManagerApplication : Application() {
         SettingsRepository.initialize(this)
         StorageRepository.initialize(this)
         DownloadRepository.initialize(this)
-        ContentBlocker.initialize(this)
+        runCatching { ContentBlocker.initialize(this) }
     }
 }

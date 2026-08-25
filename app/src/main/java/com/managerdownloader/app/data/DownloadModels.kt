@@ -28,8 +28,13 @@ data class DownloadTask(
     val detail: String? = null,
     val cookie: String? = null,
     val userAgent: String? = null,
+    val referer: String? = null,
     val expectedSha256: String? = null,
-    val actualSha256: String? = null
+    val actualSha256: String? = null,
+    /** Original page URL used to refresh short-lived extracted stream URLs (for example YouTube). */
+    val originalSourceUrl: String? = null,
+    /** Extractor-specific format id/itag used to refresh an expired stream URL. */
+    val sourceFormatId: String? = null
 ) {
     val progress: Float
         get() = if (totalBytes > 0) {

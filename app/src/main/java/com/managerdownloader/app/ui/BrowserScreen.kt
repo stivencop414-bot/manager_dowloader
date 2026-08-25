@@ -4,7 +4,11 @@ import android.annotation.SuppressLint
 import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
+import android.util.Log
+import android.view.ViewGroup
+import android.widget.FrameLayout
 import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.ServiceWorkerClient
 import android.webkit.ServiceWorkerController
@@ -16,7 +20,9 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -37,13 +43,20 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Badge
+import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -60,6 +73,8 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.key
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
@@ -76,22 +91,57 @@ import com.managerdownloader.app.youtube.YouTubeFormatKind
 import com.managerdownloader.app.youtube.YouTubeLink
 import com.managerdownloader.app.youtube.YouTubeUrlParser
 import com.managerdownloader.app.youtube.YouTubeVideoDetails
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.launch
-import org.json.JSONArray
+
+data class BrowserDownloadRequest(
+    val url: String,
+    val filename: String?,
+    val cookie: String?,
+    val userAgent: String?,
+    val referer: String?,
+    val originalSourceUrl: String? = null,
+    val sourceFormatId: String? = null
+)
+
+private enum class DetectedMediaKind(val label: String) {
+    DIRECT("Directo"),
+    STREAM("Stream"),
+    BLOB("Blob")
+}
+
+private enum class MediaBatchFilter(val label: String) {
+    ALL("Todos"),
+    DIRECT("Descargables"),
+    STREAM("Streams"),
+    BLOB("Blob")
+}
 
 private data class DetectedDownload(
     val url: String,
     val filename: String,
     val cookie: String?,
-    val userAgent: String?
-)
+    val userAgent: String?,
+    val referer: String? = null,
+    val mimeType: String? = null,
+    val kind: DetectedMediaKind = DetectedMediaKind.DIRECT
+) {
+    val downloadable: Boolean get() = kind == DetectedMediaKind.DIRECT
+}
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun BrowserScreen(
     contentPadding: PaddingValues,
-    onAdd: (String, String?, String?, String?) -> Unit,
+    onAdd: (String, String?, String?, String?, String?, String?, String?) -> Unit,
+    onAddBatch: (List<BrowserDownloadRequest>) -> Unit,
+    initialUrl: String? = null,
     incomingUrl: String? = null,
+    isVisible: Boolean = true,
+    onCurrentUrlChanged: (String) -> Unit = {},
     onIncomingUrlConsumed: () -> Unit = {}
 ) {
     val context = LocalContext.current
@@ -99,9 +149,13 @@ fun BrowserScreen(
     val settings by SettingsRepository.settings.collectAsState()
     val scope = rememberCoroutineScope()
 
+    val initialBrowserUrl = remember(initialUrl, settings.searchEngine) {
+        initialUrl?.trim()?.takeIf { it.startsWith("http://", true) || it.startsWith("https://", true) }
+            ?: homeUrl(settings.searchEngine)
+    }
     var webView by remember { mutableStateOf<WebView?>(null) }
-    var address by remember { mutableStateOf(homeUrl(settings.searchEngine)) }
-    var currentUrl by remember { mutableStateOf(homeUrl(settings.searchEngine)) }
+    var address by remember { mutableStateOf(initialBrowserUrl) }
+    var currentUrl by remember { mutableStateOf(initialBrowserUrl) }
     var pageTitle by remember { mutableStateOf("Navegador") }
     var canGoBack by remember { mutableStateOf(false) }
     var canGoForward by remember { mutableStateOf(false) }
@@ -111,6 +165,7 @@ fun BrowserScreen(
     var blockerRevision by remember { mutableIntStateOf(0) }
     var lastSearchInput by remember { mutableStateOf<String?>(null) }
     val mediaDetected = remember { mutableStateListOf<DetectedDownload>() }
+    val selectedMediaUrls = remember { mutableStateListOf<String>() }
     var showMediaDetected by remember { mutableStateOf(false) }
     var youtubeLink by remember { mutableStateOf<YouTubeLink?>(null) }
     var youtubeDetails by remember { mutableStateOf<YouTubeVideoDetails?>(null) }
@@ -118,12 +173,20 @@ fun BrowserScreen(
     var youtubeLoading by remember { mutableStateOf(false) }
     var showYouTubeDialog by remember { mutableStateOf(false) }
     var webViewGeneration by remember { mutableIntStateOf(0) }
+    var rendererRecoveryUrl by remember { mutableStateOf<String?>(null) }
+    var browserSafeMode by remember { mutableStateOf(false) }
+    val browserSafeModeRef = remember { AtomicBoolean(false) }
+    val activePageUrlRef = remember { AtomicReference(currentUrl) }
 
     fun rememberMedia(item: DetectedDownload) {
         if (!SettingsRepository.settings.value.mediaSnifferEnabled) return
+        if (item.url.isBlank()) return
         if (mediaDetected.none { it.url == item.url }) {
             mediaDetected.add(item)
-            while (mediaDetected.size > 16) mediaDetected.removeAt(0)
+            while (mediaDetected.size > MAX_DETECTED_ITEMS) {
+                val removed = mediaDetected.removeAt(0)
+                selectedMediaUrls.remove(removed.url)
+            }
         }
     }
 
@@ -179,22 +242,36 @@ fun BrowserScreen(
     }
 
     LaunchedEffect(Unit) {
-        ContentBlocker.refreshIfStale()
+        ContentBlocker.setEmergencyBypass(false)
         installServiceWorkerBlocker()
     }
 
-    LaunchedEffect(incomingUrl) {
+    LaunchedEffect(incomingUrl, webView, webViewGeneration) {
         val url = incomingUrl?.trim().orEmpty()
-        if (url.isNotBlank()) {
+        if (url.isNotBlank() && webView != null) {
             navigate(url)
             YouTubeUrlParser.parse(url)?.let { analyzeYouTube(it) }
             onIncomingUrlConsumed()
         }
     }
 
+    LaunchedEffect(isVisible, webView) {
+        val view = webView ?: return@LaunchedEffect
+        runCatching {
+            if (isVisible) {
+                view.onResume()
+                view.resumeTimers()
+            } else {
+                view.onPause()
+                view.pauseTimers()
+            }
+        }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
+            .alpha(if (isVisible) 1f else 0f)
             .padding(
                 top = contentPadding.calculateTopPadding(),
                 bottom = contentPadding.calculateBottomPadding()
@@ -260,12 +337,6 @@ fun BrowserScreen(
                     Text(if (settings.adBlockEnabled) "AdBlock ON" else "AdBlock OFF")
                 }
 
-                if (mediaDetected.isNotEmpty()) {
-                    TextButton(onClick = { showMediaDetected = true }) {
-                        Text("Medios ${mediaDetected.size}")
-                    }
-                }
-
                 val activeYouTube = youtubeLink
                 if (activeYouTube != null) {
                     TextButton(onClick = {
@@ -310,6 +381,29 @@ fun BrowserScreen(
                 }) {
                     Text(if (siteAllowed) "Activar bloqueo aquí" else "Permitir este sitio")
                 }
+            }
+        }
+
+        if (browserSafeMode) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    "Modo seguro: AdBlock y sniffer pausados tras recuperar Chromium.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.weight(1f)
+                )
+                TextButton(onClick = {
+                    browserSafeMode = false
+                    browserSafeModeRef.set(false)
+                    ContentBlocker.setEmergencyBypass(false)
+                    pageError = null
+                    webView?.reload()
+                }) { Text("Reactivar") }
             }
         }
 
@@ -358,208 +452,322 @@ fun BrowserScreen(
             }
         }
 
-        key(webViewGeneration) {
-        AndroidView(
+        Box(
             modifier = Modifier
                 .weight(1f)
-                .fillMaxWidth(),
-            factory = {
-                WebView(context).apply {
-                    this.settings.javaScriptEnabled = true
-                    this.settings.domStorageEnabled = true
-                    this.settings.databaseEnabled = true
-                    this.settings.allowFileAccess = false
-                    this.settings.allowContentAccess = true
-                    this.settings.setSupportMultipleWindows(false)
-                    this.settings.javaScriptCanOpenWindowsAutomatically = false
-                    this.settings.mediaPlaybackRequiresUserGesture = true
-                    this.settings.builtInZoomControls = true
-                    this.settings.displayZoomControls = false
-                    this.settings.loadWithOverviewMode = true
-                    this.settings.useWideViewPort = true
-                    this.settings.cacheMode = WebSettings.LOAD_DEFAULT
-                    this.settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
-                    this.settings.safeBrowsingEnabled = true
+                .fillMaxWidth()
+        ) {
+            key(webViewGeneration) {
+                AndroidView(
+                    modifier = Modifier.fillMaxSize(),
+                    factory = {
+                        val host = FrameLayout(context)
+                        var candidate: WebView? = null
+                        runCatching {
+                            WebView(context).also { candidate = it }.apply {
+                                val createdView = this
+                                runCatching { resumeTimers() }
+                                runCatching { onResume() }
 
-                    CookieManager.getInstance().setAcceptCookie(true)
-                    CookieManager.getInstance().setAcceptThirdPartyCookies(
-                        this,
-                        SettingsRepository.settings.value.thirdPartyCookies
-                    )
-                    val defaultUa = WebSettings.getDefaultUserAgent(context)
-                    this.settings.userAgentString = if (SettingsRepository.settings.value.chromeCompatUserAgent) {
-                        chromeCompatibleUserAgent(defaultUa)
-                    } else {
-                        defaultUa
-                    }
-                    setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_BOUND, false)
+                                runCatching { this.settings.javaScriptEnabled = true }
+                                runCatching { this.settings.domStorageEnabled = true }
+                                runCatching { this.settings.databaseEnabled = true }
+                                runCatching { this.settings.allowFileAccess = false }
+                                runCatching { this.settings.allowContentAccess = true }
+                                runCatching { this.settings.setSupportMultipleWindows(false) }
+                                runCatching { this.settings.javaScriptCanOpenWindowsAutomatically = false }
+                                runCatching { this.settings.mediaPlaybackRequiresUserGesture = true }
+                                runCatching { this.settings.builtInZoomControls = true }
+                                runCatching { this.settings.displayZoomControls = false }
+                                runCatching { this.settings.loadWithOverviewMode = true }
+                                runCatching { this.settings.useWideViewPort = true }
+                                runCatching { this.settings.cacheMode = WebSettings.LOAD_DEFAULT }
+                                runCatching { this.settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW }
+                                runCatching { this.settings.safeBrowsingEnabled = true }
 
-                    webChromeClient = object : WebChromeClient() {
-                        override fun onProgressChanged(view: WebView?, newProgress: Int) {
-                            progress = newProgress.coerceIn(0, 100)
-                        }
-
-                        override fun onReceivedTitle(view: WebView?, title: String?) {
-                            pageTitle = title?.takeIf { it.isNotBlank() } ?: "Navegador"
-                        }
-
-                    }
-
-                    webViewClient = object : WebViewClient() {
-                        override fun shouldInterceptRequest(
-                            view: WebView?,
-                            request: WebResourceRequest?
-                        ): WebResourceResponse? {
-                            val url = request?.url?.toString()
-                            if (
-                                SettingsRepository.settings.value.mediaSnifferEnabled &&
-                                YouTubeUrlParser.parse(view?.url) == null &&
-                                request?.isForMainFrame != true &&
-                                url != null &&
-                                isLikelyMediaUrl(url)
-                            ) {
-                                view?.post { rememberMedia(detectedItem(url, view)) }
-                            }
-                            return if (ContentBlocker.shouldBlock(url, request?.isForMainFrame == true, request?.method)) ContentBlocker.blockedResponse() else null
-                        }
-
-                        override fun shouldOverrideUrlLoading(
-                            view: WebView?,
-                            request: WebResourceRequest?
-                        ): Boolean {
-                            val url = request?.url?.toString().orEmpty()
-                            if (url.isBlank()) return false
-                            if (
-                                url.startsWith("magnet:", ignoreCase = true) ||
-                                url.substringBefore('?').endsWith(".torrent", ignoreCase = true)
-                            ) {
-                                detected = detectedItem(url, view)
-                                return true
-                            }
-                            if (url.startsWith("http://", true) || url.startsWith("https://", true) || url.startsWith("about:", true)) {
-                                return false
-                            }
-                            openExternal(context, url)
-                            return true
-                        }
-
-                        override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
-                            pageError = null
-                            currentUrl = url
-                            address = url
-                            canGoBack = view.canGoBack()
-                            canGoForward = view.canGoForward()
-                            ContentBlocker.setActivePage(url)
-                            updateYouTubeLink(url)
-                            mediaDetected.clear()
-                        }
-
-                        override fun onPageFinished(view: WebView, url: String) {
-                            currentUrl = url
-                            address = url
-                            canGoBack = view.canGoBack()
-                            canGoForward = view.canGoForward()
-                            ContentBlocker.setActivePage(url)
-                            if (SettingsRepository.settings.value.mediaSnifferEnabled && YouTubeUrlParser.parse(url) == null) {
-                                scanMediaFromDom(view, url) { mediaUrl ->
-                                    rememberMedia(detectedItem(mediaUrl, view))
+                                runCatching { CookieManager.getInstance().setAcceptCookie(true) }
+                                runCatching {
+                                    CookieManager.getInstance().setAcceptThirdPartyCookies(
+                                        this,
+                                        SettingsRepository.settings.value.thirdPartyCookies
+                                    )
                                 }
-                                view.postDelayed({
-                                    if (view.isAttachedToWindow && view.url == url && SettingsRepository.settings.value.mediaSnifferEnabled) {
-                                        scanMediaFromDom(view, url) { mediaUrl ->
-                                            rememberMedia(detectedItem(mediaUrl, view))
+                                val defaultUa = runCatching { WebSettings.getDefaultUserAgent(context) }
+                                    .getOrDefault(DEFAULT_BROWSER_UA)
+                                runCatching {
+                                    this.settings.userAgentString = if (SettingsRepository.settings.value.chromeCompatUserAgent) {
+                                        chromeCompatibleUserAgent(defaultUa)
+                                    } else {
+                                        defaultUa
+                                    }
+                                }
+                                runCatching { setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_BOUND, false) }
+
+                                runCatching {
+                                    addJavascriptInterface(
+                                        MediaSnifferBridge(
+                                            webViewProvider = { createdView },
+                                            onFound = { rawUrl, typeHint ->
+                                                if (!browserSafeModeRef.get() && YouTubeUrlParser.parse(activePageUrlRef.get()) == null) {
+                                                    val kind = mediaKindForUrl(rawUrl, typeHint)
+                                                    if (kind != null) {
+                                                        rememberMedia(
+                                                            detectedItem(
+                                                                url = rawUrl,
+                                                                webView = createdView,
+                                                                kind = kind,
+                                                                referer = activePageUrlRef.get()
+                                                            )
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        ),
+                                        JS_BRIDGE_NAME
+                                    )
+                                }
+
+                                webChromeClient = object : WebChromeClient() {
+                                    override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                                        progress = newProgress.coerceIn(0, 100)
+                                    }
+
+                                    override fun onReceivedTitle(view: WebView?, title: String?) {
+                                        pageTitle = title?.takeIf { it.isNotBlank() } ?: "Navegador"
+                                    }
+                                }
+
+                                webViewClient = object : WebViewClient() {
+                                    override fun shouldInterceptRequest(
+                                        view: WebView?,
+                                        request: WebResourceRequest?
+                                    ): WebResourceResponse? {
+                                        if (browserSafeModeRef.get()) return null
+                                        val url = request?.url?.toString()
+                                        val pageSnapshot = activePageUrlRef.get()
+                                        val kind = url?.let { mediaKindForUrl(it, null) }
+                                        if (
+                                            SettingsRepository.settings.value.mediaSnifferEnabled &&
+                                            YouTubeUrlParser.parse(pageSnapshot) == null &&
+                                            request?.isForMainFrame != true &&
+                                            url != null &&
+                                            kind != null
+                                        ) {
+                                            val headerReferer = request.requestHeaders.entries
+                                                .firstOrNull { it.key.equals("Referer", ignoreCase = true) }
+                                                ?.value
+                                            view?.post {
+                                                if (webView === view && view.isAttachedToWindow) {
+                                                    rememberMedia(
+                                                        detectedItem(
+                                                            url = url,
+                                                            webView = view,
+                                                            kind = kind,
+                                                            referer = headerReferer ?: activePageUrlRef.get()
+                                                        )
+                                                    )
+                                                }
+                                            }
+                                        }
+                                        return if (ContentBlocker.shouldBlock(url, request?.isForMainFrame == true, request?.method)) {
+                                            ContentBlocker.blockedResponse()
+                                        } else {
+                                            null
                                         }
                                     }
-                                }, 1500L)
-                            }
-                        }
 
-                        override fun onReceivedError(
-                            view: WebView?,
-                            request: WebResourceRequest?,
-                            error: WebResourceError?
-                        ) {
-                            if (request?.isForMainFrame == true) {
-                                pageError = "No se pudo cargar la página: ${error?.description ?: "error de red"}"
-                            }
-                        }
+                                    override fun shouldOverrideUrlLoading(
+                                        view: WebView?,
+                                        request: WebResourceRequest?
+                                    ): Boolean {
+                                        val url = request?.url?.toString().orEmpty()
+                                        if (url.isBlank()) return false
+                                        if (
+                                            url.startsWith("magnet:", ignoreCase = true) ||
+                                            url.substringBefore('?').endsWith(".torrent", ignoreCase = true)
+                                        ) {
+                                            detected = detectedItem(url, view, referer = activePageUrlRef.get())
+                                            return true
+                                        }
+                                        if (url.startsWith("http://", true) || url.startsWith("https://", true) || url.startsWith("about:", true)) {
+                                            return false
+                                        }
+                                        openExternal(context, url)
+                                        return true
+                                    }
 
-                        override fun onReceivedHttpError(
-                            view: WebView?,
-                            request: WebResourceRequest?,
-                            errorResponse: WebResourceResponse?
-                        ) {
-                            if (request?.isForMainFrame == true && (errorResponse?.statusCode ?: 0) >= 400) {
-                                pageError = "La página respondió HTTP ${errorResponse?.statusCode}. Puedes reintentar o cargarla sin AdBlock."
-                            }
-                        }
+                                    override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
+                                        pageError = null
+                                        currentUrl = url
+                                        activePageUrlRef.set(url)
+                                        onCurrentUrlChanged(url)
+                                        address = url
+                                        canGoBack = runCatching { view.canGoBack() }.getOrDefault(false)
+                                        canGoForward = runCatching { view.canGoForward() }.getOrDefault(false)
+                                        ContentBlocker.setActivePage(url)
+                                        updateYouTubeLink(url)
+                                        mediaDetected.clear()
+                                        selectedMediaUrls.clear()
+                                        showMediaDetected = false
+                                    }
 
-                        override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
-                            runCatching { view?.destroy() }
-                            webView = null
-                            pageError = "El proceso del navegador se reinició para evitar que se cierre toda la app. Pulsa Reintentar."
-                            webViewGeneration++
-                            return true
+                                    override fun onPageFinished(view: WebView, url: String) {
+                                        currentUrl = url
+                                        activePageUrlRef.set(url)
+                                        onCurrentUrlChanged(url)
+                                        rendererRecoveryUrl = null
+                                        address = url
+                                        canGoBack = runCatching { view.canGoBack() }.getOrDefault(false)
+                                        canGoForward = runCatching { view.canGoForward() }.getOrDefault(false)
+                                        ContentBlocker.setActivePage(url)
+                                        if (!browserSafeModeRef.get() && SettingsRepository.settings.value.mediaSnifferEnabled && YouTubeUrlParser.parse(url) == null) {
+                                            installBoundedMediaSniffer(view)
+                                        }
+                                    }
+
+                                    override fun onReceivedError(
+                                        view: WebView?,
+                                        request: WebResourceRequest?,
+                                        error: WebResourceError?
+                                    ) {
+                                        if (request?.isForMainFrame == true) {
+                                            pageError = "No se pudo cargar la página: ${error?.description ?: "error de red"}"
+                                        }
+                                    }
+
+                                    override fun onReceivedHttpError(
+                                        view: WebView?,
+                                        request: WebResourceRequest?,
+                                        errorResponse: WebResourceResponse?
+                                    ) {
+                                        if (request?.isForMainFrame == true && (errorResponse?.statusCode ?: 0) >= 400) {
+                                            pageError = "La página respondió HTTP ${errorResponse?.statusCode}. Puedes reintentar o cargarla sin AdBlock."
+                                        }
+                                    }
+
+                                    override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
+                                        val recovery = activePageUrlRef.get()
+                                        rendererRecoveryUrl = recovery
+                                        browserSafeMode = true
+                                        browserSafeModeRef.set(true)
+                                        ContentBlocker.setEmergencyBypass(true)
+                                        if (webView === view) webView = null
+                                        destroyDeadWebView(view)
+                                        val crashed = detail?.didCrash() ?: true
+                                        Log.e("WebViewStability", "Renderer terminado. didCrash=$crashed")
+                                        pageError = if (crashed) {
+                                            "El motor del navegador falló; se recreó en modo seguro."
+                                        } else {
+                                            "Android liberó Chromium por memoria; se recuperó en modo seguro."
+                                        }
+                                        webViewGeneration++
+                                        return true
+                                    }
+                                }
+
+                                setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
+                                    if (!isDownloadableScheme(url)) return@setDownloadListener
+                                    if (!isRealFileDownload(url, mimeType, contentDisposition)) return@setDownloadListener
+
+                                    val item = DetectedDownload(
+                                        url = url,
+                                        filename = if (url.startsWith("magnet:", true)) {
+                                            magnetName(url)
+                                        } else {
+                                            URLUtil.guessFileName(url, contentDisposition, mimeType)
+                                        },
+                                        cookie = if (url.startsWith("http", true)) {
+                                            runCatching { CookieManager.getInstance().getCookie(url) }.getOrNull()
+                                        } else {
+                                            null
+                                        },
+                                        userAgent = userAgent,
+                                        referer = activePageUrlRef.get(),
+                                        mimeType = mimeType,
+                                        kind = DetectedMediaKind.DIRECT
+                                    )
+                                    if (SettingsRepository.settings.value.mediaSnifferEnabled && YouTubeUrlParser.parse(activePageUrlRef.get()) == null) {
+                                        rememberMedia(item)
+                                    }
+                                    detected = item
+                                }
+
+                                val initial = rendererRecoveryUrl
+                                    ?.takeIf { it.startsWith("http://", true) || it.startsWith("https://", true) }
+                                    ?: activePageUrlRef.get().takeIf { it.isNotBlank() }
+                                    ?: homeUrl(SettingsRepository.settings.value.searchEngine)
+                                currentUrl = initial
+                                activePageUrlRef.set(initial)
+                                address = initial
+                                webView = this
+                                host.addView(
+                                    this,
+                                    FrameLayout.LayoutParams(
+                                        ViewGroup.LayoutParams.MATCH_PARENT,
+                                        ViewGroup.LayoutParams.MATCH_PARENT
+                                    )
+                                )
+                                loadUrl(initial)
+                            }
+                        }.onFailure { error ->
+                            val failedView = candidate
+                            if (webView === failedView) webView = null
+                            cleanupWebView(failedView)
+                            pageError = "No se pudo iniciar el navegador integrado. Actualiza Android System WebView/Chrome y pulsa Reintentar."
+                            Log.e("WebViewStability", "No se pudo crear/configurar WebView", error)
+                        }
+                        host
+                    },
+                    update = { _ ->
+                        webView?.let { view ->
+                            val defaultUa = runCatching { WebSettings.getDefaultUserAgent(context) }
+                                .getOrDefault(DEFAULT_BROWSER_UA)
+                            val desiredUa = if (settings.chromeCompatUserAgent) chromeCompatibleUserAgent(defaultUa) else defaultUa
+                            runCatching {
+                                if (view.settings.userAgentString != desiredUa) {
+                                    view.settings.userAgentString = desiredUa
+                                }
+                            }
+                            runCatching { CookieManager.getInstance().setAcceptThirdPartyCookies(view, settings.thirdPartyCookies) }
                         }
                     }
-
-                    setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
-                        if (!isDownloadableScheme(url)) return@setDownloadListener
-                        if (!isRealFileDownload(url, mimeType, contentDisposition)) return@setDownloadListener
-
-                        val item = DetectedDownload(
-                            url = url,
-                            filename = if (url.startsWith("magnet:", true)) {
-                                magnetName(url)
-                            } else {
-                                URLUtil.guessFileName(url, contentDisposition, mimeType)
-                            },
-                            cookie = if (url.startsWith("http", true)) CookieManager.getInstance().getCookie(url) else null,
-                            userAgent = userAgent
-                        )
-                        if (
-                            SettingsRepository.settings.value.mediaSnifferEnabled &&
-                            YouTubeUrlParser.parse(currentUrl) == null &&
-                            (mimeType?.startsWith("video/") == true ||
-                                mimeType?.startsWith("audio/") == true ||
-                                isLikelyMediaUrl(url))
-                        ) {
-                            rememberMedia(item)
-                        }
-                        detected = item
-                    }
-
-                    val initial = homeUrl(SettingsRepository.settings.value.searchEngine)
-                    currentUrl = initial
-                    address = initial
-                    loadUrl(initial)
-                    webView = this
-                }
-            },
-            update = { view ->
-                webView = view
-                val defaultUa = WebSettings.getDefaultUserAgent(context)
-                val desiredUa = if (settings.chromeCompatUserAgent) chromeCompatibleUserAgent(defaultUa) else defaultUa
-                if (view.settings.userAgentString != desiredUa) {
-                    view.settings.userAgentString = desiredUa
-                }
-                runCatching { CookieManager.getInstance().setAcceptThirdPartyCookies(view, settings.thirdPartyCookies) }
+                )
             }
-        )
+
+            if (mediaDetected.isNotEmpty()) {
+                FloatingActionButton(
+                    onClick = { showMediaDetected = true },
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(16.dp)
+                ) {
+                    BadgedBox(
+                        badge = {
+                            Badge {
+                                Text(if (mediaDetected.size > 99) "99+" else mediaDetected.size.toString())
+                            }
+                        }
+                    ) {
+                        Icon(Icons.Default.Download, contentDescription = "Descargas detectadas")
+                    }
+                }
+            }
         }
     }
 
     DisposableEffect(Unit) {
         onDispose {
             ContentBlocker.setActivePage(null)
-            webView?.stopLoading()
-            webView?.destroy()
+            ContentBlocker.setEmergencyBypass(false)
+            val view = webView
             webView = null
+            cleanupWebView(view)
         }
     }
 
-    if (showYouTubeDialog && youtubeLink != null) {
-        val link = youtubeLink!!
+    val visibleYouTubeLink = youtubeLink
+    if (isVisible && showYouTubeDialog && visibleYouTubeLink != null) {
+        val link = visibleYouTubeLink
         AlertDialog(
             onDismissRequest = { if (!youtubeLoading) showYouTubeDialog = false },
             title = { Text("YouTube detectado") },
@@ -603,7 +811,15 @@ fun BrowserScreen(
                                     modifier = Modifier.fillMaxWidth(),
                                     onClick = {
                                         val cookie = CookieManager.getInstance().getCookie(details.sourceUrl)
-                                        onAdd(option.url, option.filename, cookie, webView?.settings?.userAgentString)
+                                        onAdd(
+                                            option.url,
+                                            option.filename,
+                                            cookie,
+                                            runCatching { webView?.settings?.userAgentString }.getOrNull(),
+                                            details.sourceUrl,
+                                            details.sourceUrl,
+                                            option.id
+                                        )
                                         showYouTubeDialog = false
                                     }
                                 ) { Text("Descargar ${option.label}") }
@@ -618,7 +834,15 @@ fun BrowserScreen(
                                     modifier = Modifier.fillMaxWidth(),
                                     onClick = {
                                         val cookie = CookieManager.getInstance().getCookie(details.sourceUrl)
-                                        onAdd(option.url, option.filename, cookie, webView?.settings?.userAgentString)
+                                        onAdd(
+                                            option.url,
+                                            option.filename,
+                                            cookie,
+                                            runCatching { webView?.settings?.userAgentString }.getOrNull(),
+                                            details.sourceUrl,
+                                            details.sourceUrl,
+                                            option.id
+                                        )
                                         showYouTubeDialog = false
                                     }
                                 ) { Text("Descargar ${option.label}") }
@@ -659,51 +883,56 @@ fun BrowserScreen(
         )
     }
 
-    if (showMediaDetected) {
-        AlertDialog(
-            onDismissRequest = { showMediaDetected = false },
-            title = { Text("Medios detectados") },
-            text = {
-                Column {
-                    Text(
-                        "Enlaces HTTP/HTTPS de video y audio detectados por el reproductor o por URLs multimedia. Se omiten imágenes, iconos y recursos decorativos. No intenta romper DRM ni descargar blob: internos.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Spacer(Modifier.height(8.dp))
-                    mediaDetected.takeLast(12).reversed().forEach { item ->
-                        TextButton(
-                            modifier = Modifier.fillMaxWidth(),
-                            onClick = {
-                                detected = item
-                                showMediaDetected = false
-                            }
-                        ) {
-                            Text(item.filename, maxLines = 1)
-                        }
-                    }
-                }
+    if (isVisible && showMediaDetected) {
+        MediaBatchSheet(
+            items = mediaDetected.toList(),
+            selectedUrls = selectedMediaUrls.toSet(),
+            onDismiss = { showMediaDetected = false },
+            onReplaceSelection = { next ->
+                selectedMediaUrls.clear()
+                selectedMediaUrls.addAll(next)
             },
-            confirmButton = {
-                TextButton(onClick = { showMediaDetected = false }) { Text("Cerrar") }
+            onOpenItem = { item ->
+                detected = item
+                showMediaDetected = false
+            },
+            onDownloadSelected = {
+                val selected = selectedMediaUrls.toSet()
+                val requests = mediaDetected
+                    .filter { it.downloadable && it.url in selected }
+                    .map { item ->
+                        BrowserDownloadRequest(
+                            url = item.url,
+                            filename = item.filename,
+                            cookie = item.cookie,
+                            userAgent = item.userAgent,
+                            referer = item.referer,
+                            originalSourceUrl = null,
+                            sourceFormatId = null
+                        )
+                    }
+                if (requests.isNotEmpty()) onAddBatch(requests)
+                selectedMediaUrls.clear()
+                showMediaDetected = false
             }
         )
     }
 
-    detected?.let { item ->
+    if (isVisible) detected?.let { item ->
         AlertDialog(
             onDismissRequest = { detected = null },
             title = {
                 Text(
-                    if (item.url.startsWith("magnet:", true) || item.url.substringBefore('?').endsWith(".torrent", true)) {
-                        "Torrent detectado"
-                    } else {
-                        "Descarga detectada"
+                    when {
+                        item.url.startsWith("magnet:", true) || item.url.substringBefore('?').endsWith(".torrent", true) -> "Torrent detectado"
+                        item.kind == DetectedMediaKind.STREAM -> "Stream detectado"
+                        item.kind == DetectedMediaKind.BLOB -> "Blob detectado"
+                        else -> "Descarga detectada"
                     }
                 )
             },
             text = {
-                Column {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Text(item.filename, style = MaterialTheme.typography.titleMedium)
                     Text(
                         item.url,
@@ -711,21 +940,39 @@ fun BrowserScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 4
                     )
+                    if (!item.downloadable) {
+                        Text(
+                            if (item.kind == DetectedMediaKind.STREAM) {
+                                "Es un manifiesto HLS/DASH, no un archivo de video completo. Se detecta para análisis, pero no se guarda como .txt ni se añade al motor HTTP directo."
+                            } else {
+                                "Es una URL blob interna de la página. WebView no expone sus bytes como un archivo HTTP directo; se muestra solo como diagnóstico."
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                 }
             },
             confirmButton = {
-                Button(
-                    onClick = {
-                        onAdd(item.url, item.filename, item.cookie, item.userAgent)
-                        detected = null
-                    }
-                ) { Text("Añadir a la cola") }
+                if (item.downloadable) {
+                    Button(
+                        onClick = {
+                            onAdd(item.url, item.filename, item.cookie, item.userAgent, item.referer, null, null)
+                            detected = null
+                        }
+                    ) { Text("Añadir a la cola") }
+                } else {
+                    TextButton(onClick = { detected = null }) { Text("Cerrar") }
+                }
             },
             dismissButton = {
-                TextButton(onClick = { detected = null }) { Text("Cancelar") }
+                if (item.downloadable) {
+                    TextButton(onClick = { detected = null }) { Text("Cancelar") }
+                }
             }
         )
     }
+
 }
 
 private fun installServiceWorkerBlocker() {
@@ -734,21 +981,242 @@ private fun installServiceWorkerBlocker() {
             object : ServiceWorkerClient() {
                 override fun shouldInterceptRequest(request: WebResourceRequest): WebResourceResponse? {
                     val url = request.url?.toString()
-                    return if (ContentBlocker.shouldBlock(url, request.isForMainFrame, request.method)) ContentBlocker.blockedResponse() else null
+                    return if (ContentBlocker.shouldBlock(url, request.isForMainFrame, request.method)) {
+                        ContentBlocker.blockedResponse()
+                    } else {
+                        null
+                    }
                 }
             }
         )
     }
 }
 
-private fun detectedItem(url: String, webView: WebView?): DetectedDownload {
-    val name = if (url.startsWith("magnet:", true)) magnetName(url) else URLUtil.guessFileName(url, null, null)
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun MediaBatchSheet(
+    items: List<DetectedDownload>,
+    selectedUrls: Set<String>,
+    onDismiss: () -> Unit,
+    onReplaceSelection: (Set<String>) -> Unit,
+    onOpenItem: (DetectedDownload) -> Unit,
+    onDownloadSelected: () -> Unit
+) {
+    var filter by remember { mutableStateOf(MediaBatchFilter.ALL) }
+    val filtered = remember(items, filter) {
+        when (filter) {
+            MediaBatchFilter.ALL -> items
+            MediaBatchFilter.DIRECT -> items.filter { it.kind == DetectedMediaKind.DIRECT }
+            MediaBatchFilter.STREAM -> items.filter { it.kind == DetectedMediaKind.STREAM }
+            MediaBatchFilter.BLOB -> items.filter { it.kind == DetectedMediaKind.BLOB }
+        }
+    }
+    val eligibleUrls = filtered.filter { it.downloadable }.map { it.url }.toSet()
+    val allEligibleSelected = eligibleUrls.isNotEmpty() && eligibleUrls.all { it in selectedUrls }
+
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Text("Descargas detectadas", style = MaterialTheme.typography.titleLarge)
+            Text(
+                "${items.size} detectadas · ${selectedUrls.size} seleccionadas. Los HLS/DASH y blob se muestran como diagnóstico, pero no se guardan como archivos de texto.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                MediaBatchFilter.entries.forEach { option ->
+                    FilterChip(
+                        selected = filter == option,
+                        onClick = { filter = option },
+                        label = { Text(option.label) }
+                    )
+                }
+            }
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(
+                    checked = allEligibleSelected,
+                    enabled = eligibleUrls.isNotEmpty(),
+                    onCheckedChange = { checked ->
+                        val next = selectedUrls.toMutableSet()
+                        if (checked) next.addAll(eligibleUrls) else next.removeAll(eligibleUrls)
+                        onReplaceSelection(next)
+                    }
+                )
+                Text(if (allEligibleSelected) "Deseleccionar descargables" else "Seleccionar descargables")
+            }
+
+            HorizontalDivider()
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(420.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                filtered.forEach { item ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Checkbox(
+                            checked = item.url in selectedUrls,
+                            enabled = item.downloadable,
+                            onCheckedChange = { checked ->
+                                val next = selectedUrls.toMutableSet()
+                                if (checked) next.add(item.url) else next.remove(item.url)
+                                onReplaceSelection(next)
+                            }
+                        )
+                        Column(Modifier.weight(1f)) {
+                            Text(item.filename, maxLines = 1)
+                            Text(
+                                buildString {
+                                    append(item.kind.label)
+                                    item.mimeType?.takeIf { it.isNotBlank() }?.let { append(" · $it") }
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        TextButton(onClick = { onOpenItem(item) }) { Text("Ver") }
+                    }
+                }
+            }
+
+            Button(
+                modifier = Modifier.fillMaxWidth(),
+                enabled = selectedUrls.any { selected -> items.any { it.url == selected && it.downloadable } },
+                onClick = onDownloadSelected
+            ) {
+                Icon(Icons.Default.Download, contentDescription = null)
+                Spacer(Modifier.width(6.dp))
+                Text("Descargar selección")
+            }
+            Spacer(Modifier.height(8.dp))
+        }
+    }
+}
+
+private class MediaSnifferBridge(
+    private val webViewProvider: () -> WebView?,
+    private val onFound: (String, String) -> Unit
+) {
+    private val rateWindowStartedAt = AtomicLong(System.currentTimeMillis())
+    private val callbacksInWindow = AtomicInteger(0)
+
+    @JavascriptInterface
+    fun onMediaFound(rawUrl: String?, typeHint: String?) {
+        val url = rawUrl?.trim().orEmpty()
+        if (url.isBlank() || url.length > MAX_SNIFFER_URL_LENGTH || url.startsWith("data:", true)) return
+        if (
+            !url.startsWith("http://", true) &&
+            !url.startsWith("https://", true) &&
+            !url.startsWith("blob:", true) &&
+            !url.startsWith("magnet:", true)
+        ) return
+
+        // The JS interface is reachable by page JavaScript. Cap callbacks so a buggy or hostile
+        // page cannot flood the Android main queue and make the browser look like it crashed.
+        val now = System.currentTimeMillis()
+        val windowStart = rateWindowStartedAt.get()
+        if (now - windowStart >= SNIFFER_RATE_WINDOW_MS && rateWindowStartedAt.compareAndSet(windowStart, now)) {
+            callbacksInWindow.set(0)
+        }
+        if (callbacksInWindow.incrementAndGet() > MAX_SNIFFER_CALLBACKS_PER_WINDOW) return
+
+        val view = webViewProvider() ?: return
+        view.post {
+            if (view.isAttachedToWindow) {
+                onFound(url, typeHint.orEmpty().take(24))
+            }
+        }
+    }
+}
+
+private fun installBoundedMediaSniffer(view: WebView) {
+    if (!view.isAttachedToWindow) return
+    runCatching { view.evaluateJavascript(MEDIA_SNIFFER_SCRIPT, null) }
+}
+
+private fun destroyDeadWebView(view: WebView?) {
+    if (view == null) return
+    runCatching { (view.parent as? ViewGroup)?.removeView(view) }
+    runCatching { view.removeJavascriptInterface(JS_BRIDGE_NAME) }
+    runCatching { view.destroy() }
+}
+
+private fun cleanupWebView(view: WebView?) {
+    if (view == null) return
+    runCatching { (view.parent as? ViewGroup)?.removeView(view) }
+    runCatching { view.stopLoading() }
+    runCatching { view.removeJavascriptInterface(JS_BRIDGE_NAME) }
+    runCatching { view.webViewClient = WebViewClient() }
+    runCatching { view.webChromeClient = null }
+    runCatching { view.clearHistory() }
+    runCatching { view.loadUrl("about:blank") }
+    runCatching { view.onPause() }
+    runCatching { view.pauseTimers() }
+    runCatching { view.destroy() }
+}
+
+private fun detectedItem(
+    url: String,
+    webView: WebView?,
+    kind: DetectedMediaKind = mediaKindForUrl(url, null) ?: DetectedMediaKind.DIRECT,
+    mimeType: String? = null,
+    referer: String? = null
+): DetectedDownload {
+    val name = when {
+        url.startsWith("magnet:", true) -> magnetName(url)
+        kind == DetectedMediaKind.BLOB -> "Blob temporal del reproductor"
+        kind == DetectedMediaKind.STREAM && url.contains(".m3u8", true) -> "Stream HLS (.m3u8)"
+        kind == DetectedMediaKind.STREAM && url.contains(".mpd", true) -> "Stream DASH (.mpd)"
+        else -> URLUtil.guessFileName(url, null, mimeType)
+    }
     return DetectedDownload(
         url = url,
         filename = name,
-        cookie = if (url.startsWith("http", true)) CookieManager.getInstance().getCookie(url) else null,
-        userAgent = webView?.settings?.userAgentString
+        cookie = if (url.startsWith("http", true)) {
+            runCatching { CookieManager.getInstance().getCookie(url) }.getOrNull()
+        } else {
+            null
+        },
+        userAgent = runCatching { webView?.settings?.userAgentString }.getOrNull(),
+        referer = referer,
+        mimeType = mimeType,
+        kind = kind
     )
+}
+
+private fun mediaKindForUrl(url: String, typeHint: String?): DetectedMediaKind? {
+    val trimmed = url.trim()
+    if (trimmed.startsWith("blob:", true) || typeHint.equals("blob", true)) {
+        return DetectedMediaKind.BLOB
+    }
+    if (trimmed.startsWith("magnet:", true)) return DetectedMediaKind.DIRECT
+    if (!trimmed.startsWith("http://", true) && !trimmed.startsWith("https://", true)) return null
+
+    val lower = trimmed.lowercase()
+    val clean = lower.substringBefore('#').substringBefore('?')
+    if (MEDIA_FRAGMENT_EXTENSIONS.any { clean.endsWith(it) }) return null
+    if (lower.contains(".m3u8") || lower.contains(".mpd")) return DetectedMediaKind.STREAM
+    if (DIRECT_SNIFFER_EXTENSIONS.any { clean.endsWith(it) }) return DetectedMediaKind.DIRECT
+    if (typeHint.equals("video", true) || typeHint.equals("audio", true) || typeHint.equals("source", true)) {
+        return DetectedMediaKind.DIRECT
+    }
+    return null
 }
 
 private fun magnetName(url: String): String = runCatching {
@@ -760,15 +1228,8 @@ private fun isDownloadableScheme(url: String): Boolean =
         url.startsWith("https://", true) ||
         url.startsWith("magnet:", true)
 
-private fun isLikelyMediaUrl(url: String): Boolean {
-    val clean = url.substringBefore('#').substringBefore('?').lowercase()
-    return MEDIA_EXTENSIONS.any { clean.endsWith(it) }
-}
-
-private val MEDIA_EXTENSIONS = setOf(
-    ".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".3gp",
-    ".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".opus"
-)
+private fun isLikelyMediaUrl(url: String): Boolean =
+    mediaKindForUrl(url, null) == DetectedMediaKind.DIRECT
 
 private fun isRealFileDownload(url: String, mimeType: String?, contentDisposition: String?): Boolean {
     if (url.startsWith("magnet:", true)) return true
@@ -805,6 +1266,9 @@ private val DIRECT_FILE_EXTENSIONS = setOf(
     ".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".opus",
     ".zip", ".rar", ".7z", ".pdf", ".apk", ".xapk", ".iso", ".torrent"
 )
+
+private val DIRECT_SNIFFER_EXTENSIONS = DIRECT_FILE_EXTENSIONS + setOf(".exe", ".msi", ".doc", ".docx", ".xlsx", ".pptx")
+private val MEDIA_FRAGMENT_EXTENSIONS = setOf(".ts", ".m4s", ".cmfv", ".cmfa")
 
 private fun formatDuration(seconds: Long): String {
     val safe = seconds.coerceAtLeast(0L)
@@ -857,63 +1321,129 @@ private fun chromeCompatibleUserAgent(defaultUa: String): String = defaultUa
 
 private fun openExternal(context: android.content.Context, url: String) {
     runCatching {
-        val intent = if (url.startsWith("intent:", true)) {
-            Intent.parseUri(url, Intent.URI_INTENT_SCHEME)
+        val parsed = Uri.parse(url)
+        val scheme = parsed.scheme?.lowercase().orEmpty()
+
+        val intent = if (scheme == "intent") {
+            Intent.parseUri(url, Intent.URI_INTENT_SCHEME).apply {
+                // A web page must never be able to target a private component directly.
+                addCategory(Intent.CATEGORY_BROWSABLE)
+                component = null
+                selector = null
+                clipData = null
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
         } else {
-            Intent(Intent.ACTION_VIEW, Uri.parse(url))
-        }.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            if (scheme !in SAFE_EXTERNAL_SCHEMES) return
+            Intent(Intent.ACTION_VIEW, parsed).apply {
+                addCategory(Intent.CATEGORY_BROWSABLE)
+                component = null
+                selector = null
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+        }
         context.startActivity(intent)
     }
 }
 
+private val SAFE_EXTERNAL_SCHEMES = setOf(
+    "mailto", "tel", "sms", "smsto", "geo", "market"
+)
+
 private val IPV4_REGEX = Regex("""^(?:\\d{1,3}\\.){3}\\d{1,3}(?::\\d+)?$""")
 
-private fun scanMediaFromDom(
-    view: WebView,
-    expectedPageUrl: String,
-    onMedia: (String) -> Unit
-) {
-    if (!view.isAttachedToWindow) return
-    runCatching {
-        view.evaluateJavascript(MEDIA_SNIFFER_SCRIPT) { raw ->
-            if (view.url != expectedPageUrl || raw.isNullOrBlank() || raw == "null") return@evaluateJavascript
-            val array = runCatching { JSONArray(raw) }.getOrNull() ?: return@evaluateJavascript
-            val count = minOf(array.length(), 12)
-            for (index in 0 until count) {
-                val url = array.optString(index).trim()
-                if (url.startsWith("http://", true) || url.startsWith("https://", true)) {
-                    onMedia(url)
-                }
-            }
-        }
-    }
-}
+private const val JS_BRIDGE_NAME = "ManagerSnifferBridge"
+private const val MAX_DETECTED_ITEMS = 40
+private const val MAX_SNIFFER_URL_LENGTH = 8_192
+private const val SNIFFER_RATE_WINDOW_MS = 1_000L
+private const val MAX_SNIFFER_CALLBACKS_PER_WINDOW = 80
+private const val DEFAULT_BROWSER_UA =
+    "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36"
 
 private const val MEDIA_SNIFFER_SCRIPT = """
 (function() {
   try {
-    const found = [];
+    if (window.__managerDownloaderSnifferCleanup) {
+      try { window.__managerDownloaderSnifferCleanup(); } catch (_) {}
+    }
+
+    const bridge = window.ManagerSnifferBridge;
+    if (!bridge || !bridge.onMediaFound) return;
     const seen = new Set();
-    const mediaRx = /\.(mp4|mkv|webm|avi|mov|m4v|3gp|mp3|m4a|aac|flac|wav|ogg|opus)(?:$|[?#])/i;
-    const add = function(raw) {
+    const MAX = 40;
+    const mediaRx = /\.(mp4|mkv|webm|avi|mov|m4v|3gp|mp3|m4a|aac|flac|wav|ogg|opus|m3u8|mpd|zip|pdf|apk|torrent)(?:$|[?#])/i;
+    const fragmentRx = /\.(ts|m4s|cmfv|cmfa)(?:$|[?#])/i;
+
+    function report(raw, type) {
       try {
-        if (!raw || raw.indexOf('blob:') === 0 || raw.indexOf('data:') === 0) return;
-        const absolute = new URL(raw, document.baseURI).href;
-        if (!/^https?:/i.test(absolute) || seen.has(absolute)) return;
+        if (!raw || typeof raw !== 'string' || seen.size >= MAX || raw.indexOf('data:') === 0) return;
+        let absolute = raw;
+        if (raw.indexOf('blob:') !== 0 && raw.indexOf('magnet:') !== 0) {
+          absolute = new URL(raw, document.baseURI).href;
+        }
+        if (seen.has(absolute) || fragmentRx.test(absolute)) return;
+        if (!/^https?:/i.test(absolute) && absolute.indexOf('blob:') !== 0 && absolute.indexOf('magnet:') !== 0) return;
         seen.add(absolute);
-        found.push(absolute);
+        bridge.onMediaFound(absolute, type || 'unknown');
       } catch (_) {}
+    }
+
+    function inspectElement(el) {
+      if (!el || el.nodeType !== 1 || seen.size >= MAX) return;
+      const tag = (el.tagName || '').toUpperCase();
+      if (tag === 'VIDEO' || tag === 'AUDIO' || tag === 'SOURCE') {
+        report(el.currentSrc || el.src || el.getAttribute('src'), tag.toLowerCase());
+      } else if (tag === 'A') {
+        const href = el.href || el.getAttribute('href');
+        if (href && mediaRx.test(href)) report(href, 'link');
+      }
+    }
+
+    function inspectNode(node) {
+      if (!node || node.nodeType !== 1 || seen.size >= MAX) return;
+      inspectElement(node);
+      if (node.querySelectorAll && seen.size < MAX) {
+        node.querySelectorAll('video,audio,source,a[href]').forEach(function(child) {
+          if (seen.size < MAX) inspectElement(child);
+        });
+      }
+    }
+
+    document.querySelectorAll('video,audio,source,a[href]').forEach(function(el) {
+      if (seen.size < MAX) inspectElement(el);
+    });
+
+    const observer = new MutationObserver(function(mutations) {
+      if (seen.size >= MAX) {
+        observer.disconnect();
+        return;
+      }
+      mutations.forEach(function(mutation) {
+        mutation.addedNodes.forEach(function(node) {
+          if (seen.size < MAX) inspectNode(node);
+        });
+      });
+    });
+    observer.observe(document.documentElement || document.body, {childList:true, subtree:true});
+
+    const originalCreate = URL.createObjectURL.bind(URL);
+    const patchedCreate = function(obj) {
+      const blobUrl = originalCreate(obj);
+      report(blobUrl, 'blob');
+      return blobUrl;
     };
-    document.querySelectorAll('video,audio,source').forEach(function(el) {
-      add(el.currentSrc || el.src || el.getAttribute('src'));
-    });
-    document.querySelectorAll('a[href]').forEach(function(el) {
-      const href = el.href || el.getAttribute('href');
-      if (mediaRx.test(href || '')) add(href);
-    });
-    return found.slice(0, 12);
-  } catch (_) {
-    return [];
-  }
+    URL.createObjectURL = patchedCreate;
+
+    const timer = setTimeout(function() {
+      try { observer.disconnect(); } catch (_) {}
+      try { if (URL.createObjectURL === patchedCreate) URL.createObjectURL = originalCreate; } catch (_) {}
+    }, 15000);
+
+    window.__managerDownloaderSnifferCleanup = function() {
+      try { observer.disconnect(); } catch (_) {}
+      try { clearTimeout(timer); } catch (_) {}
+      try { if (URL.createObjectURL === patchedCreate) URL.createObjectURL = originalCreate; } catch (_) {}
+    };
+  } catch (_) {}
 })();
 """
