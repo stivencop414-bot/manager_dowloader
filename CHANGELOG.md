@@ -1,57 +1,44 @@
-# Manager Downloader v0.7.3
+# Manager Downloader v0.7.5
 
-## Corrección del fallo de v0.7.2
-- El run `32890603012` no llegó a compilar: falló en la validación previa del workflow porque buscaba el marcador `browserSafeMode`, ausente en el ZIP v0.7.2.
-- El workflow v0.7.3 sustituye esa validación frágil por comprobaciones explícitas con mensajes y genera un log de preflight además del log de compilación.
-- `main` permanece en v0.7.1 hasta que v0.7.3 compile correctamente.
+## Enfoque
+Esta versión está dedicada a estabilización, corrección de casos borde y reducción de falsos positivos tomando como base la auditoría técnica de v0.7.3. No introduce una migración arquitectónica grande ni nuevas funciones de alto riesgo.
 
-## Estabilidad crítica del motor HTTP
-- Se elimina la fusión final de archivos `.segN`: las descargas segmentadas escriben directamente sobre un único archivo parcial `.$id.part` mediante `FileChannel` y offsets posicionales.
-- El archivo parcial se preasigna al tamaño esperado; cuando termina, se finaliza con renombrado en lugar de duplicar todo el archivo en disco.
-- Se conserva migración de parciales antiguos `.segN` para no perder progreso previo.
-- Se valida estrictamente `Content-Range`; si un servidor responde `200` a una petición Range o entrega un rango incoherente, se abandona el modo segmentado y se cambia de forma segura a una conexión.
-- El pool fijo de segmentos se sustituye por executor elástico + `Semaphore` global, evitando starvation entre varias descargas paralelas.
-- Si falla SHA-256, se elimina el parcial corrupto y el estado asociado antes de permitir otro reintento.
+## Torrent
+- Pausar o cancelar mientras libtorrent todavía resuelve el `TorrentHandle` ya no termina en un falso error de inicio.
+- La espera inicial y el bucle de progreso usan pausas cancelables en intervalos cortos para responder más rápido a Pausa/Cancelar.
+- Se conservan el vaciado de caché previo a retirar el handle y la resolución cancelable de magnets de v0.7.3.
 
-## Persistencia sin bloquear la interfaz
-- `DownloadRepository` mantiene el estado en memoria bajo locks cortos y mueve JSON/AtomicFile a `Dispatchers.IO`.
-- Persistencia atómica y debounced; progreso se guarda como máximo aproximadamente cada 3 segundos.
-- Se evitan `writeText()` completos dentro del lock principal de UI/red.
-- Nuevos campos compatibles hacia atrás: `referer`, `originalSourceUrl` y `sourceFormatId`.
+## YouTube / NewPipe
+- `OkHttpExtractorDownloader` deja de copiar el encabezado `Accept-Encoding` enviado por NewPipe.
+- OkHttp recupera su descompresión gzip transparente, evitando que HTML/JSON comprimido llegue al extractor como bytes ilegibles.
+- Se conserva la re-extracción automática de URLs temporales cuando una descarga extraída falla con HTTP 403.
 
-## Navegador y WebView
-- La creación/configuración de WebView queda aislada para que un proveedor WebView defectuoso no cierre la app.
-- `onRenderProcessGone` desmonta y destruye el renderer muerto, devuelve `true` y recrea una vista limpia.
-- Modo seguro del navegador tras caída del renderer para reducir carga de sniffer/JS hasta que el usuario lo reactive.
-- Limpieza defensiva del WebView y del bridge JavaScript al salir.
-- Conserva la última URL al cambiar entre pestañas y durante cambios de configuración.
-- Sniffer temporal y limitado: detecta directos/HLS/DASH/blob sin acumular fragmentos `.ts/.m4s` ni mantener observadores ilimitados.
-- Cookie, User-Agent y Referer se preservan en las descargas detectadas.
+## Navegador y sniffer
+- Nuevo `MediaSnifferFilter` centralizado.
+- Descarta fragmentos `.ts/.m4s/.cmfv/.cmfa`, subtítulos, claves HLS, imágenes, iconos y patrones comunes de analytics/telemetría.
+- Los elementos conocidos de menos de 150 KB se excluyen de la lista pasiva de medios para reducir sonidos de interfaz y previews irrelevantes.
+- La deduplicación usa una URL canónica que elimina solo parámetros de fragmentación `range`, `bytes`, `start` y `end`.
+- La URL original se conserva intacta para descargar, evitando romper firmas, tokens o parámetros de expiración de CDN.
+- El JavaScript sniffer aplica también filtros y deduplicación antes de cruzar el `JavascriptInterface`.
+- HLS/DASH y `blob:` continúan identificados como streams/no descargables directos; no se guardan accidentalmente como MP4.
+- Una descarga explícita iniciada por `DownloadListener` sigue siendo accionable aunque sea pequeña; el umbral de 150 KB solo limpia detecciones pasivas.
 
-## Seguridad
-- `FileProvider` deja de exponer `path="."`; solo comparte las carpetas administradas de descargas.
-- Se deshabilita cleartext global y se agrega `network_security_config` con TLS como base.
-- `openExternal()` limpia `component`, `selector` y `clipData`, exige `CATEGORY_BROWSABLE` y restringe esquemas externos.
-- Sanitización reforzada para nombres `.` / `..`, separadores, NUL y caracteres problemáticos.
+## Cola y rendimiento estable
+- El modo simultáneo queda limitado a 2–4 descargas activas; 3 sigue siendo el valor predeterminado.
+- En datos móviles o red no identificada, la segmentación se limita automáticamente a 4 conexiones por archivo.
+- En modo paralelo, el presupuesto de los 8 permisos globales se reparte de forma más conservadora entre tareas activas.
+- En modo secuencial sobre Wi‑Fi se conserva el perfil adaptativo de hasta 8 conexiones para archivos grandes.
 
-## Almacenamiento SAF
-- Se evita `DocumentFile.findFile()` repetitivo en bucles de colisión; los nombres existentes se consultan una sola vez a `HashSet`.
-- Las operaciones largas de mover archivos terminados usan un scope de aplicación en IO, no `lifecycleScope`, para no abortarse al rotar la Activity.
+## Conservado de v0.7.3
+- Archivo único `.part`, escritura posicional y preasignación.
+- Persistencia asíncrona con `AtomicFile`.
+- `WakeLock`/`WifiLock` durante transferencias.
+- Validación estricta de `Content-Range`.
+- Purga de parciales corruptos en SHA-256.
+- SAF optimizado, FileProvider restringido y cleartext deshabilitado.
+- WebView persistente entre pestañas y recuperación de renderer.
+- Sanitización de intents externos y nombres.
+- Flush de caché de torrent antes de publicar archivos.
 
-## Energía y Android moderno
-- `DownloadService` adquiere `PARTIAL_WAKE_LOCK` y `WifiLock` únicamente mientras hay transferencias activas, con liberación defensiva al quedar inactivo/destruirse.
-- Se mantiene el manejo de `onTimeout` del foreground service y el estado parcial antes de detenerlo.
-
-## Torrents
-- `fetchMagnet` se ejecuta en un Future y se sondea cada 250 ms para responder a pausa/cancelación sin bloquear 60 s el hilo de transferencia.
-- Antes de mover/eliminar un torrent terminado se solicita `flushCache()` y se espera de forma acotada el `CACHE_FLUSHED` de libtorrent.
-- Se mantienen límites móviles conservadores de conexiones/peers.
-
-## YouTube
-- Las tareas extraídas guardan la URL de origen y el identificador del formato.
-- Ante un `HTTP 403` de un stream temporal, se intenta re-extraer un enlace fresco con NewPipeExtractor y reanudar sobre el mismo parcial.
-- No se intenta eludir DRM, autenticación, contenido privado ni controles de acceso.
-
-## Aplazado deliberadamente
-- Migración completa a Koin/ViewModels/Room: requiere una refactorización transversal y no es necesaria para corregir los fallos críticos actuales.
-- Streaming/remux HLS/DASH y fusión automática 1080p/4K de YouTube: se mantiene fuera de esta revisión de estabilidad.
+## Fuera de alcance de v0.7.5
+MediaMuxer para 1080p/4K, playlists de YouTube y lectura del portapapeles se dejan para versiones posteriores. La prioridad de esta entrega es no ampliar la superficie de fallos antes de validar estabilidad.

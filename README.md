@@ -1,27 +1,33 @@
 # Manager Downloader
 
-## v0.7.3
+## v0.7.5
 Administrador de descargas Android nativo en Kotlin + Jetpack Compose.
 
-### Navegador estable
-- WebView alojado en un contenedor seguro y recuperación ante `onRenderProcessGone`.
-- Sniffer temporal para medios dinámicos, con límites para evitar saturación.
-- Detección separada de archivos directos, HLS/DASH y blob.
-- Descarga múltiple de archivos directos detectados.
-- Cookie, User-Agent y Referer conservados al enviar descargas desde el navegador.
+Esta revisión prioriza estabilidad y corrige casos borde encontrados después de la auditoría de v0.7.3.
 
+### Descargas
+- HTTP/HTTPS con Range, archivo único `.part`, pausa y reanudación.
+- Segmentación adaptativa de 1–8 conexiones; en datos móviles se limita a 4.
+- Cola secuencial por defecto o paralelo moderado de 2–4 tareas.
+- Limitador global, Solo Wi‑Fi, WakeLock/WifiLock durante transferencias y verificación SHA-256.
+- BitTorrent/magnet con cancelación responsive y flush de cache antes de publicar.
 
-### Rendimiento
-- HTTP/HTTPS con Range y hasta 8 conexiones adaptativas por archivo.
-- Perfil recomendado: 6 conexiones por archivo en Modo Turbo.
-- Buffers directos y FileChannel para reducir presión de memoria.
-- Limitador global, Solo Wi-Fi, pausa, reanudación y reintentos.
-- BitTorrent/magnet con perfil de conexiones más conservador para móviles.
+### Navegador
+- WebView persistente entre pestañas con recuperación del renderer.
+- AdBlock configurable.
+- Sniffer dinámico con filtrado de recursos auxiliares, tracking y deduplicación por URL canónica.
+- HLS/DASH/blob se identifican sin tratarlos como archivos directos.
 
-### Navegador y YouTube
-- Mantiene detección dedicada de YouTube con NewPipe Extractor.
-- Evita descargar páginas HTML/TXT como archivos.
-- Share Sheet de Android, AdBlock configurable y recuperación de WebView.
+### YouTube
+- NewPipeExtractor para videos públicos compatibles.
+- Transparent gzip corregido en el cliente interno.
+- Re-extracción de enlaces temporales tras HTTP 403.
+- Las pistas 1080p/4K separadas siguen sin fusionarse en esta versión.
 
-### Almacenamiento
-- Storage Access Framework, categorías, abrir, compartir, mover y eliminar archivos terminados.
+### Seguridad
+- FileProvider restringido.
+- HTTP cleartext deshabilitado por defecto.
+- Intents externos sanitizados.
+- Nombres de archivo y rutas administradas validados.
+
+El usuario debe descargar únicamente contenido que tenga derecho o permiso para guardar.

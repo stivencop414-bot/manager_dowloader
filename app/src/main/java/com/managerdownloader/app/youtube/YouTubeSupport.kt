@@ -239,8 +239,12 @@ private class OkHttpExtractorDownloader : Downloader() {
             .header("User-Agent", USER_AGENT)
 
         request.headers().forEach { (name, values) ->
-            builder.removeHeader(name)
-            values.forEach { value -> builder.addHeader(name, value) }
+            // Explicit Accept-Encoding disables OkHttp transparent gzip. Let OkHttp negotiate
+            // and decompress responses so NewPipe always receives readable text/JSON.
+            if (!name.equals("Accept-Encoding", ignoreCase = true)) {
+                builder.removeHeader(name)
+                values.forEach { value -> builder.addHeader(name, value) }
+            }
         }
 
         val response = client.newCall(builder.build()).execute()

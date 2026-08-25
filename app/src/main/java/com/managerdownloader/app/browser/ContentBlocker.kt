@@ -220,7 +220,7 @@ object ContentBlocker {
     private fun downloadRules(url: String, limit: Int): Set<String> = runCatching {
         val request = Request.Builder()
             .url(url)
-            .header("User-Agent", "ManagerDownloader/0.7.3")
+            .header("User-Agent", "ManagerDownloader/0.7.5")
             .get()
             .build()
         client.newCall(request).execute().use { response ->

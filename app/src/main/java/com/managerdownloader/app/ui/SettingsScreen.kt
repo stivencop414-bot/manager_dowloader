@@ -128,8 +128,8 @@ fun SettingsScreen(
                         SettingsRepository.setMaxParallelDownloads(parallelDraft.roundToInt())
                         onTransferSettingsChanged()
                     },
-                    valueRange = 2f..6f,
-                    steps = 3
+                    valueRange = 2f..4f,
+                    steps = 1
                 )
             }
         }

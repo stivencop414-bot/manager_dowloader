@@ -84,6 +84,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import com.managerdownloader.app.browser.ContentBlocker
+import com.managerdownloader.app.browser.MediaSnifferFilter
 import com.managerdownloader.app.data.SearchEngine
 import com.managerdownloader.app.data.SettingsRepository
 import com.managerdownloader.app.youtube.YouTubeExtractorClient
@@ -181,7 +182,13 @@ fun BrowserScreen(
     fun rememberMedia(item: DetectedDownload) {
         if (!SettingsRepository.settings.value.mediaSnifferEnabled) return
         if (item.url.isBlank()) return
-        if (mediaDetected.none { it.url == item.url }) {
+        if (!MediaSnifferFilter.isCleanMediaCandidate(item.url)) return
+
+        val canonicalKey = MediaSnifferFilter.canonicalMediaUrl(item.url)
+        val duplicate = mediaDetected.any {
+            MediaSnifferFilter.canonicalMediaUrl(it.url) == canonicalKey
+        }
+        if (!duplicate) {
             mediaDetected.add(item)
             while (mediaDetected.size > MAX_DETECTED_ITEMS) {
                 val removed = mediaDetected.removeAt(0)
@@ -551,7 +558,8 @@ fun BrowserScreen(
                                             YouTubeUrlParser.parse(pageSnapshot) == null &&
                                             request?.isForMainFrame != true &&
                                             url != null &&
-                                            kind != null
+                                            kind != null &&
+                                            MediaSnifferFilter.isCleanMediaCandidate(url)
                                         ) {
                                             val headerReferer = request.requestHeaders.entries
                                                 .firstOrNull { it.key.equals("Referer", ignoreCase = true) }
@@ -665,7 +673,7 @@ fun BrowserScreen(
                                     }
                                 }
 
-                                setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
+                                setDownloadListener { url, userAgent, contentDisposition, mimeType, contentLength ->
                                     if (!isDownloadableScheme(url)) return@setDownloadListener
                                     if (!isRealFileDownload(url, mimeType, contentDisposition)) return@setDownloadListener
 
@@ -686,9 +694,15 @@ fun BrowserScreen(
                                         mimeType = mimeType,
                                         kind = DetectedMediaKind.DIRECT
                                     )
-                                    if (SettingsRepository.settings.value.mediaSnifferEnabled && YouTubeUrlParser.parse(activePageUrlRef.get()) == null) {
+                                    if (
+                                        SettingsRepository.settings.value.mediaSnifferEnabled &&
+                                        YouTubeUrlParser.parse(activePageUrlRef.get()) == null &&
+                                        MediaSnifferFilter.isCleanMediaCandidate(url, contentLength.takeIf { it > 0L })
+                                    ) {
                                         rememberMedia(item)
                                     }
+                                    // A real user-triggered DownloadListener remains actionable even for a
+                                    // small file; the 150 KB rule only cleans the passive sniffer list.
                                     detected = item
                                 }
 
@@ -1207,6 +1221,7 @@ private fun mediaKindForUrl(url: String, typeHint: String?): DetectedMediaKind? 
     }
     if (trimmed.startsWith("magnet:", true)) return DetectedMediaKind.DIRECT
     if (!trimmed.startsWith("http://", true) && !trimmed.startsWith("https://", true)) return null
+    if (!MediaSnifferFilter.isCleanMediaCandidate(trimmed)) return null
 
     val lower = trimmed.lowercase()
     val clean = lower.substringBefore('#').substringBefore('?')
@@ -1372,7 +1387,20 @@ private const val MEDIA_SNIFFER_SCRIPT = """
     const seen = new Set();
     const MAX = 40;
     const mediaRx = /\.(mp4|mkv|webm|avi|mov|m4v|3gp|mp3|m4a|aac|flac|wav|ogg|opus|m3u8|mpd|zip|pdf|apk|torrent)(?:$|[?#])/i;
-    const fragmentRx = /\.(ts|m4s|cmfv|cmfa)(?:$|[?#])/i;
+    const ignoredRx = /\.(ts|m4s|cmfv|cmfa|vtt|srt|key|ico|svg|png|jpe?g|gif|webp)(?:$|[?#])/i;
+    const trackingRx = /(analytics|telemetry|beacon|pixel|tracker|log_event|\/collect(?:[/?#]|$)|metrics|measurement)/i;
+
+    function canonicalKey(url) {
+      try {
+        if (!/^https?:/i.test(url)) return url;
+        const u = new URL(url);
+        ['range', 'bytes', 'start', 'end'].forEach(function(name) { u.searchParams.delete(name); });
+        u.hash = '';
+        return u.href;
+      } catch (_) {
+        return url;
+      }
+    }
 
     function report(raw, type) {
       try {
@@ -1381,9 +1409,11 @@ private const val MEDIA_SNIFFER_SCRIPT = """
         if (raw.indexOf('blob:') !== 0 && raw.indexOf('magnet:') !== 0) {
           absolute = new URL(raw, document.baseURI).href;
         }
-        if (seen.has(absolute) || fragmentRx.test(absolute)) return;
+        if (ignoredRx.test(absolute) || trackingRx.test(absolute)) return;
         if (!/^https?:/i.test(absolute) && absolute.indexOf('blob:') !== 0 && absolute.indexOf('magnet:') !== 0) return;
-        seen.add(absolute);
+        const key = canonicalKey(absolute);
+        if (seen.has(key)) return;
+        seen.add(key);
         bridge.onMediaFound(absolute, type || 'unknown');
       } catch (_) {}
     }

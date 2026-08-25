@@ -23,6 +23,7 @@ import com.managerdownloader.app.data.DownloadKind
 import com.managerdownloader.app.data.DownloadRepository
 import com.managerdownloader.app.data.DownloadStatus
 import com.managerdownloader.app.data.DownloadTask
+import com.managerdownloader.app.data.QueueMode
 import com.managerdownloader.app.data.SettingsRepository
 import com.managerdownloader.app.data.StorageRepository
 import com.managerdownloader.app.youtube.YouTubeExtractorClient
@@ -251,7 +252,7 @@ class DownloadService : Service() {
 
     /**
      * Starts as many queued items as allowed by the selected queue mode.
-     * SEQUENTIAL = 1 active item. PARALLEL = user-selected 2..6 active items.
+     * SEQUENTIAL = 1 active item. PARALLEL = user-selected 2..4 active items for mobile stability.
      */
     private fun schedule() {
         if (shuttingDown.get()) return
@@ -476,10 +477,22 @@ class DownloadService : Service() {
     private fun chooseSegmentCount(total: Long, requested: Int, rangeSupported: Boolean): Int {
         if (!rangeSupported || total <= 0L) return 1
         val settings = SettingsRepository.settings.value
-        // On mobile, more than 6–8 parallel ranges usually adds radio/CPU/thermal overhead
-        // without improving throughput. Keep a hard ceiling of 8.
-        val desired = requested.coerceIn(1, 8)
-        return if (settings.turboMode) {
+
+        // Dynamic mobile budget:
+        // - cellular/unknown networks use at most 4 ranges per file;
+        // - parallel queue mode shares the 8 global permits more evenly;
+        // - sequential Wi-Fi can still use the full 6–8 range profile for large files.
+        val networkCap = if (isWifiConnected()) 8 else 4
+        val activeTransfers = active.size.coerceAtLeast(1)
+        val fairParallelCap = if (settings.queueMode == QueueMode.PARALLEL) {
+            (8 / activeTransfers).coerceIn(2, 4)
+        } else {
+            8
+        }
+        val effectiveCap = minOf(8, networkCap, fairParallelCap)
+        val desired = requested.coerceIn(1, effectiveCap)
+
+        val adaptive = if (settings.turboMode) {
             when {
                 total < 8L * 1024L * 1024L -> 1
                 total < 32L * 1024L * 1024L -> desired.coerceAtMost(2)
@@ -495,6 +508,7 @@ class DownloadService : Service() {
                 else -> desired.coerceAtMost(6)
             }
         }
+        return adaptive.coerceIn(1, effectiveCap)
     }
 
     private fun downloadSegmented(

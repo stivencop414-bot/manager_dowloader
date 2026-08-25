@@ -69,11 +69,16 @@ internal class TorrentEngine(
             manager.download(info, saveDir)
             val deadline = System.currentTimeMillis() + 15_000L
             while (handle == null && System.currentTimeMillis() < deadline && !control.stopped.get()) {
-                Thread.sleep(250)
-                handle = manager.find(info)
+                sleepCancelable(control, 250L)
+                if (!control.stopped.get()) {
+                    handle = manager.find(info)
+                }
             }
         }
 
+        // Pause/Cancel during the initial libtorrent handle resolution is a normal user action,
+        // not a failed torrent start.
+        if (control.stopped.get()) return
         val torrentHandle = handle ?: throw IOException("No se pudo iniciar el torrent")
         handles[task.id] = torrentHandle
         control.torrentHandle = torrentHandle
@@ -126,7 +131,7 @@ internal class TorrentEngine(
                     return
                 }
 
-                Thread.sleep(900)
+                sleepCancelable(control, 900L)
             }
         } finally {
             if (control.deleteOnStop.get()) {
@@ -134,6 +139,20 @@ internal class TorrentEngine(
                 handles.remove(task.id)
                 deleteRecursivelySafe(saveDir)
             }
+        }
+    }
+
+    private fun sleepCancelable(control: TransferControl, totalMs: Long) {
+        var remaining = totalMs.coerceAtLeast(0L)
+        while (remaining > 0L && !control.stopped.get()) {
+            val slice = minOf(remaining, 100L)
+            try {
+                Thread.sleep(slice)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return
+            }
+            remaining -= slice
         }
     }
 

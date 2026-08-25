@@ -1,29 +1,20 @@
-# Stability Audit — v0.7.3
+# Stability Audit — v0.7.5
 
-## Workflow
-- v0.7.2 falló en preflight, no en Kotlin: el marcador `browserSafeMode` no existía en aquel ZIP.
-- v0.7.3 registra cada comprobación de preflight y sube logs tanto si falla la validación como si falla Gradle.
+## Revisión estática realizada
+- Base v0.7.3 extraída del paquete que produjo la versión confirmada en `main`.
+- Verificación de delimitadores Kotlin en todos los `.kt`.
+- Búsqueda de regresiones conocidas: `writeText` síncrono del repositorio, `findFile` O(N²), `path="."`, `usesCleartextTraffic="true"`, `!!`, `GlobalScope`.
+- Validación de presencia de `AtomicFile`, single `.part`, `Content-Range`, `SafePowerManager`, torrent `flushCache`, refresh HTTP 403 de YouTube y WebView safe mode.
+- Revisión específica de los hallazgos nuevos del informe.
 
-## Browser
-- WebView no se almacena en ViewModel/singleton.
-- Renderer muerto: detach -> bridge/client cleanup -> destroy -> recreate -> safe mode.
-- JS bridge temporal, rate-limited y con URL máxima.
-- Última URL persistida en estado Compose saveable.
-- Intents externos saneados y esquemas limitados.
+## Cambios de estabilidad
+1. Torrent stop-before-handle tratado como salida normal.
+2. Sleeps de torrent divididos en ventanas cancelables de 100 ms.
+3. Transparent gzip restaurado en el downloader interno de NewPipe.
+4. Filtro de sniffer centralizado y deduplicación canónica.
+5. Filtro de tamaño solo para detección pasiva, sin bloquear descargas explícitas.
+6. Paralelismo de archivos reducido a máximo 4.
+7. Segmentación dinámica: máximo 4 en celular/desconocido y reparto más conservador en cola paralela.
 
-## HTTP
-- Sparse `.part` único; sin merge 2x.
-- FileChannel posicional, Content-Range estricto y fallback a single stream.
-- Semáforo global de workers para evitar starvation.
-- SHA mismatch purga parciales.
-- Re-extracción de streams temporales YouTube ante 403.
-
-## Persistence / storage
-- AtomicFile en IO, debounce y snapshots inmutables.
-- SAF usa sets/mapas de nombres por directorio para colisiones.
-- FileProvider restringido a directorios administrados.
-
-## Power / torrent
-- Locks solo con transferencias activas y liberación en idle/destroy.
-- Magnet cancelable desde la app.
-- flushCache antes de remover/mover torrent completado.
+## Validación de compilación
+El contenedor local no incluye un Android SDK/Gradle configurado para compilar esta app completa. El workflow v0.7.5 ejecuta `:app:assembleDebug` antes de tocar `main` y publica los logs de preflight y compilación incluso cuando existe un fallo.

@@ -1,30 +1,30 @@
-# Auditoría aplicada — v0.7.3
+# Auditoría aplicada — v0.7.5
 
-Base de producción: v0.7.1. El intento v0.7.2 no modificó `main` porque su workflow falló antes de compilar.
+Base confirmada: v0.7.3 en `main`, commit `335c2e6906cb20faec61fce1cc600c89ab46bc58`.
 
-Hallazgos del informe contrastados con el código y tratados en esta versión:
+## Hallazgos nuevos del informe y tratamiento
 
-- BUG-01: corregido con un único archivo `.part` y escritura posicional; no hay merge final 2x.
-- BUG-02: corregido con executor elástico + semáforo global y espera cancelable de Futures.
-- BUG-03: corregido con persistencia AtomicFile asíncrona y coalescida fuera del lock.
-- BUG-04: corregido evitando búsquedas SAF O(N²) para colisiones de nombre.
-- SEC-01: corregido restringiendo FileProvider a carpetas de descargas administradas.
-- SEC-02: corregido deshabilitando cleartext global por defecto.
-- SEC-03: corregido endureciendo intents externos del WebView.
-- BUG-05: corregido con WakeLock/WifiLock acotados al trabajo activo.
-- BUG-06: corregido validando HTTP 206/Content-Range y haciendo fallback seguro a una conexión.
-- BUG-07: mitigado mediante flushCache + espera acotada antes de quitar el TorrentHandle y mover datos.
-- BUG-08: mitigado haciendo fetchMagnet cancelable desde el flujo de la app.
-- BUG-09: mitigado conservando URL/sesión lógica del navegador y recuperación del renderer; no se retiene WebView en ViewModel.
-- BUG-10: mitigado re-extrayendo URLs temporales de YouTube ante 403 usando originalSourceUrl/sourceFormatId.
-- BUG-11: corregido usando scope de aplicación IO para operaciones de movimiento de archivos.
-- SEC-04: corregido reforzando sanitización de nombres.
-- SEC-05: corregido eliminando parciales/metadata tras fallo SHA-256.
-- BUG-12: implementado de manera acotada: observer/bridge temporal y rate-limited, con HLS/DASH/blob clasificados; no se deja observador infinito.
-- BUG-13: diferido. Koin/ViewModels es una modernización arquitectónica, no una corrección necesaria para evitar pérdida de datos o crashes en esta versión.
+### Pausa temprana de torrent
+Hallazgo confirmado en `TorrentEngine.kt`: tras abandonar la espera de `manager.find(info)` por `control.stopped`, el código podía llegar a la validación de handle nulo. v0.7.5 retorna de forma normal cuando la transferencia ya fue detenida y usa espera cancelable.
 
-Riesgos que siguen existiendo:
-- Android System WebView/Chromium es un proceso externo y el SO puede matar su renderer bajo presión de memoria; la app ahora lo recupera.
-- jlibtorrent contiene JNI/C++; se reducen carreras conocidas, pero un fallo nativo no puede aislarse completamente desde Kotlin.
-- Los proveedores SAF pueden ser lentos por implementación del fabricante/nube incluso reduciendo IPC repetitivo.
-- La validación definitiva es `:app:assembleDebug` en GitHub Actions más pruebas reales en dispositivo.
+### GZIP de NewPipe
+Hallazgo confirmado en `YouTubeSupport.kt`: los headers del extractor se copiaban íntegros, incluido `Accept-Encoding`. v0.7.5 omite exclusivamente ese header para que OkHttp gestione transparent gzip. No se cambia el `Accept-Encoding: identity` del motor de descargas Range, donde se necesita identidad byte-a-byte.
+
+### Ruido del sniffer
+Se añade `MediaSnifferFilter` con:
+- extensiones descartadas;
+- patrones de tracking;
+- umbral opcional de 150 KB cuando Content-Length es conocido;
+- clave canónica para deduplicar requests por rango sin modificar la URL real;
+- deduplicación también en `enqueueBatch`.
+
+El sniffer DOM sigue acotado temporalmente y no se convierte en un observer ilimitado.
+
+### Cola
+La auditoría recomienda secuencial para archivos grandes y paralelo moderado para lotes pequeños. v0.7.5 mantiene `SEQUENTIAL` como predeterminado, reduce el techo paralelo a 4 tareas y añade un presupuesto de segmentos condicionado por Wi‑Fi/celular y número de transferencias activas.
+
+## Decisiones de riesgo
+No se integran MediaMuxer, playlists, portapapeles, Koin ni Room en esta revisión. Son cambios funcionales/arquitectónicos y no correcciones necesarias para los casos borde auditados.
+
+## Compatibilidad
+No cambia el modelo persistido de descargas. Las preferencias antiguas con `maxParallelDownloads` de 5 o 6 se normalizan automáticamente a 4 al iniciar.

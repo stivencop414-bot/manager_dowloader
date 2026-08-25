@@ -47,7 +47,7 @@ data class TransferSettings(
     val themeMode: ThemeMode = ThemeMode.SYSTEM
 ) {
     val activeTransferLimit: Int
-        get() = if (queueMode == QueueMode.SEQUENTIAL) 1 else maxParallelDownloads.coerceIn(2, 6)
+        get() = if (queueMode == QueueMode.SEQUENTIAL) 1 else maxParallelDownloads.coerceIn(2, 4)
 
     val bandwidthLimitBytesPerSecond: Long
         get() = if (bandwidthLimitMbps <= 0) 0L else bandwidthLimitMbps.toLong() * 1024L * 1024L
@@ -85,7 +85,7 @@ object SettingsRepository {
             queueMode = runCatching {
                 QueueMode.valueOf(prefs.getString(KEY_QUEUE_MODE, QueueMode.SEQUENTIAL.name) ?: QueueMode.SEQUENTIAL.name)
             }.getOrDefault(QueueMode.SEQUENTIAL),
-            maxParallelDownloads = prefs.getInt(KEY_MAX_PARALLEL, 3).coerceIn(2, 6),
+            maxParallelDownloads = prefs.getInt(KEY_MAX_PARALLEL, 3).coerceIn(2, 4),
             segmentsPerFile = prefs.getInt(KEY_SEGMENTS, 6).coerceIn(1, 8),
             turboMode = prefs.getBoolean(KEY_TURBO, true),
             segmentRetryCount = prefs.getInt(KEY_RETRIES, 2).coerceIn(0, 5),
@@ -112,7 +112,7 @@ object SettingsRepository {
     fun setQueueMode(value: QueueMode) = update { it.copy(queueMode = value) }
 
     fun setMaxParallelDownloads(value: Int) =
-        update { it.copy(maxParallelDownloads = value.coerceIn(2, 6)) }
+        update { it.copy(maxParallelDownloads = value.coerceIn(2, 4)) }
 
     fun setSegmentsPerFile(value: Int) =
         update { it.copy(segmentsPerFile = value.coerceIn(1, 8)) }

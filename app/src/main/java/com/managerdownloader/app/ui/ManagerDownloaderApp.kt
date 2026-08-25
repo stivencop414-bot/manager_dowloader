@@ -25,6 +25,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import com.managerdownloader.app.browser.MediaSnifferFilter
 import com.managerdownloader.app.data.DownloadRepository
 import com.managerdownloader.app.data.StorageRepository
 import com.managerdownloader.app.data.SettingsRepository
@@ -170,7 +171,7 @@ fun enqueue(
 }
 fun enqueueBatch(context: Context, requests: List<BrowserDownloadRequest>) {
     if (requests.isEmpty()) return
-    requests.distinctBy { it.url }.forEach { request ->
+    requests.distinctBy { MediaSnifferFilter.canonicalMediaUrl(it.url) }.forEach { request ->
         DownloadRepository.add(
             url = request.url,
             suggestedFilename = request.filename,
