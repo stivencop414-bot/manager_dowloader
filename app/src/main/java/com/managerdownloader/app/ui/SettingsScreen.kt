@@ -26,6 +26,9 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
@@ -38,6 +41,7 @@ import com.managerdownloader.app.data.SearchEngine
 import com.managerdownloader.app.data.SettingsRepository
 import com.managerdownloader.app.data.StorageRepository
 import com.managerdownloader.app.data.ThemeMode
+import kotlin.math.roundToInt
 
 @Composable
 fun SettingsScreen(
@@ -46,6 +50,10 @@ fun SettingsScreen(
     onSelectDownloadFolder: () -> Unit
 ) {
     val settings by SettingsRepository.settings.collectAsState()
+    var parallelDraft by remember(settings.maxParallelDownloads) { mutableFloatStateOf(settings.maxParallelDownloads.toFloat()) }
+    var segmentsDraft by remember(settings.segmentsPerFile) { mutableFloatStateOf(settings.segmentsPerFile.toFloat()) }
+    var retriesDraft by remember(settings.segmentRetryCount) { mutableFloatStateOf(settings.segmentRetryCount.toFloat()) }
+    var bandwidthDraft by remember(settings.bandwidthLimitMbps) { mutableFloatStateOf(settings.bandwidthLimitMbps.coerceIn(0, 100).toFloat()) }
 
     Column(
         modifier = Modifier
@@ -112,11 +120,14 @@ fun SettingsScreen(
 
             if (settings.queueMode == QueueMode.PARALLEL) {
                 Spacer(Modifier.height(10.dp))
-                Text("Máximo simultáneo: ${settings.maxParallelDownloads}", fontWeight = FontWeight.SemiBold)
+                Text("Máximo simultáneo: ${parallelDraft.roundToInt()}", fontWeight = FontWeight.SemiBold)
                 Slider(
-                    value = settings.maxParallelDownloads.toFloat(),
-                    onValueChange = { SettingsRepository.setMaxParallelDownloads(it.toInt()) },
-                    onValueChangeFinished = onTransferSettingsChanged,
+                    value = parallelDraft,
+                    onValueChange = { parallelDraft = it },
+                    onValueChangeFinished = {
+                        SettingsRepository.setMaxParallelDownloads(parallelDraft.roundToInt())
+                        onTransferSettingsChanged()
+                    },
                     valueRange = 2f..6f,
                     steps = 3
                 )
@@ -134,45 +145,56 @@ fun SettingsScreen(
                 }
             )
 
-            Text("Conexiones máximas por archivo: ${settings.segmentsPerFile}", fontWeight = FontWeight.SemiBold)
+            Text("Conexiones máximas por archivo: ${segmentsDraft.roundToInt()}", fontWeight = FontWeight.SemiBold)
             Text(
                 "Se usan solo cuando el servidor acepta HTTP Range. En modo Turbo el motor puede llegar hasta 16 segmentos en archivos grandes.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 fontSize = 12.sp
             )
             Slider(
-                value = settings.segmentsPerFile.toFloat(),
-                onValueChange = { SettingsRepository.setSegmentsPerFile(it.toInt()) },
-                onValueChangeFinished = onTransferSettingsChanged,
+                value = segmentsDraft,
+                onValueChange = { segmentsDraft = it },
+                onValueChangeFinished = {
+                    SettingsRepository.setSegmentsPerFile(segmentsDraft.roundToInt())
+                    onTransferSettingsChanged()
+                },
                 valueRange = 1f..16f,
                 steps = 14
             )
 
             Spacer(Modifier.height(8.dp))
-            Text("Reintentos por conexión: ${settings.segmentRetryCount}", fontWeight = FontWeight.SemiBold)
+            Text("Reintentos por conexión: ${retriesDraft.roundToInt()}", fontWeight = FontWeight.SemiBold)
             Text(
                 "Si una conexión se corta, el segmento intenta continuar desde los bytes ya guardados.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 fontSize = 12.sp
             )
             Slider(
-                value = settings.segmentRetryCount.toFloat(),
-                onValueChange = { SettingsRepository.setSegmentRetryCount(it.toInt()) },
-                onValueChangeFinished = onTransferSettingsChanged,
+                value = retriesDraft,
+                onValueChange = { retriesDraft = it },
+                onValueChangeFinished = {
+                    SettingsRepository.setSegmentRetryCount(retriesDraft.roundToInt())
+                    onTransferSettingsChanged()
+                },
                 valueRange = 0f..5f,
                 steps = 4
             )
 
             Spacer(Modifier.height(8.dp))
             Text(
-                if (settings.bandwidthLimitMbps == 0) "Límite de velocidad: sin límite"
-                else "Límite global: ${settings.bandwidthLimitMbps} MB/s",
+                if (bandwidthDraft.roundToInt() == 0) "Límite de velocidad: sin límite"
+                else "Límite global: ${((bandwidthDraft / 5f).roundToInt() * 5)} MB/s",
                 fontWeight = FontWeight.SemiBold
             )
             Slider(
-                value = settings.bandwidthLimitMbps.toFloat(),
-                onValueChange = { SettingsRepository.setBandwidthLimitMbps((it / 5f).toInt() * 5) },
-                onValueChangeFinished = onTransferSettingsChanged,
+                value = bandwidthDraft,
+                onValueChange = { bandwidthDraft = it },
+                onValueChangeFinished = {
+                    val snapped = ((bandwidthDraft / 5f).roundToInt() * 5).coerceIn(0, 100)
+                    bandwidthDraft = snapped.toFloat()
+                    SettingsRepository.setBandwidthLimitMbps(snapped)
+                    onTransferSettingsChanged()
+                },
                 valueRange = 0f..100f,
                 steps = 19
             )
@@ -234,7 +256,7 @@ fun SettingsScreen(
             )
             ToggleRow(
                 title = "Detector de medios",
-                subtitle = "Detecta enlaces HTTP/HTTPS de video, audio e imágenes visibles en la página y en el DOM.",
+                subtitle = "Detecta únicamente video y audio. Omite imágenes, iconos y recursos decorativos para reducir falsos positivos y consumo de memoria.",
                 checked = settings.mediaSnifferEnabled,
                 onCheckedChange = SettingsRepository::setMediaSnifferEnabled
             )

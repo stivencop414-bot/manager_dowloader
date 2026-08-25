@@ -95,7 +95,7 @@ object SettingsRepository {
                 AdBlockMode.valueOf(prefs.getString(KEY_ADBLOCK_MODE, AdBlockMode.STANDARD.name)!!)
             }.getOrDefault(AdBlockMode.STANDARD),
             wifiOnly = prefs.getBoolean(KEY_WIFI_ONLY, false),
-            bandwidthLimitMbps = prefs.getInt(KEY_BANDWIDTH, 0).coerceIn(0, 200),
+            bandwidthLimitMbps = prefs.getInt(KEY_BANDWIDTH, 0).coerceIn(0, 100),
             searchEngine = runCatching {
                 SearchEngine.valueOf(prefs.getString(KEY_SEARCH_ENGINE, SearchEngine.DUCKDUCKGO.name)!!)
             }.getOrDefault(SearchEngine.DUCKDUCKGO),
@@ -131,7 +131,7 @@ object SettingsRepository {
     fun setWifiOnly(value: Boolean) = update { it.copy(wifiOnly = value) }
 
     fun setBandwidthLimitMbps(value: Int) =
-        update { it.copy(bandwidthLimitMbps = value.coerceIn(0, 200)) }
+        update { it.copy(bandwidthLimitMbps = value.coerceIn(0, 100)) }
 
     fun setSearchEngine(value: SearchEngine) = update { it.copy(searchEngine = value) }
 

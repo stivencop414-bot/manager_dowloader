@@ -40,7 +40,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicLongArray
 import java.util.concurrent.atomic.AtomicReference
-import kotlin.math.max
+import java.util.concurrent.locks.LockSupport
 import okhttp3.Call
 import okhttp3.ConnectionPool
 import okhttp3.Dispatcher
@@ -74,31 +74,58 @@ private class SharedBandwidthLimiter(
     private val rateProvider: () -> Long
 ) {
     private val lock = Any()
-    private var nextAvailableNanos = 0L
+    private var tokens = 0.0
+    private var lastRefillNanos = System.nanoTime()
+    private var lastRate = -1L
 
     fun acquire(bytes: Int) {
-        val rate = rateProvider()
-        if (rate <= 0L || bytes <= 0) return
+        if (bytes <= 0) return
+        var remaining = bytes.toLong()
 
-        val waitNanos = synchronized(lock) {
-            val now = System.nanoTime()
-            val start = max(now, nextAvailableNanos)
-            val duration = ((bytes.toDouble() / rate.toDouble()) * 1_000_000_000.0).toLong()
-            nextAvailableNanos = start + duration
-            (start - now).coerceAtLeast(0L)
-        }
+        while (remaining > 0L && !Thread.currentThread().isInterrupted) {
+            val rate = rateProvider().coerceAtLeast(0L)
+            if (rate <= 0L) return
 
-        if (waitNanos > 0L) {
-            val millis = waitNanos / 1_000_000L
-            val nanos = (waitNanos % 1_000_000L).toInt()
-            Thread.sleep(millis, nanos)
+            var waitNanos = 0L
+            synchronized(lock) {
+                val now = System.nanoTime()
+                if (rate != lastRate) {
+                    lastRate = rate
+                    lastRefillNanos = now
+                    tokens = 0.0
+                }
+
+                val elapsed = (now - lastRefillNanos).coerceAtLeast(0L)
+                lastRefillNanos = now
+                val capacity = (rate.toDouble() * 0.25)
+                    .coerceAtLeast(32.0 * 1024.0)
+                    .coerceAtMost(2.0 * 1024.0 * 1024.0)
+                tokens = (tokens + elapsed.toDouble() / 1_000_000_000.0 * rate.toDouble())
+                    .coerceAtMost(capacity)
+
+                val granted = minOf(remaining.toDouble(), tokens).toLong()
+                if (granted > 0L) {
+                    tokens -= granted.toDouble()
+                    remaining -= granted
+                } else {
+                    val target = minOf(remaining, 64L * 1024L).coerceAtLeast(1L)
+                    waitNanos = ((target.toDouble() / rate.toDouble()) * 1_000_000_000.0)
+                        .toLong()
+                        .coerceIn(1_000_000L, 50_000_000L)
+                }
+            }
+
+            if (waitNanos > 0L) {
+                LockSupport.parkNanos(waitNanos)
+            }
         }
     }
 }
 
+
 class DownloadService : Service() {
     private val transferExecutor = Executors.newCachedThreadPool()
-    private val segmentExecutor = Executors.newFixedThreadPool(32)
+    private val segmentExecutor = Executors.newFixedThreadPool(16)
     private val schedulerLock = Any()
     private val active = ConcurrentHashMap<String, TransferControl>()
     private val shuttingDown = AtomicBoolean(false)
@@ -121,13 +148,13 @@ class DownloadService : Service() {
     }
 
     private val httpDispatcher = Dispatcher().apply {
-        maxRequests = 64
-        maxRequestsPerHost = 32
+        maxRequests = 32
+        maxRequestsPerHost = 16
     }
 
     private val client = OkHttpClient.Builder()
         .dispatcher(httpDispatcher)
-        .connectionPool(ConnectionPool(32, 5, java.util.concurrent.TimeUnit.MINUTES))
+        .connectionPool(ConnectionPool(24, 5, java.util.concurrent.TimeUnit.MINUTES))
         .followRedirects(true)
         .followSslRedirects(true)
         .retryOnConnectionFailure(true)
@@ -140,6 +167,7 @@ class DownloadService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        serviceRunning.set(true)
         createNotificationChannel()
         torrentEngine = TorrentEngine(this, client, ::downloadsDirectory)
         connectivityManager = getSystemService(ConnectivityManager::class.java)
@@ -157,6 +185,7 @@ class DownloadService : Service() {
             ACTION_CANCEL -> intent.getStringExtra(EXTRA_ID)?.let(::cancelInternal)
             ACTION_PAUSE_ALL -> pauseAllInternal()
             ACTION_RESUME_ALL -> resumeAllInternal()
+            ACTION_REFRESH_SETTINGS -> handleNetworkPolicyChange()
             ACTION_PROCESS, null -> Unit
         }
 
@@ -532,7 +561,7 @@ class DownloadService : Service() {
             RandomAccessFile(file, "rw").use { output ->
                 output.seek(existing)
                 body.byteStream().use { input ->
-                    val buffer = ByteArray(512 * 1024)
+                    val buffer = ByteArray(if (SettingsRepository.settings.value.bandwidthLimitBytesPerSecond > 0L) 64 * 1024 else 128 * 1024)
                     while (!control.stopped.get()) {
                         val read = input.read(buffer)
                         if (read == -1) break
@@ -631,7 +660,7 @@ class DownloadService : Service() {
             RandomAccessFile(partial, "rw").use { output ->
                 output.seek(existing)
                 body.byteStream().use { input ->
-                    val buffer = ByteArray(1024 * 1024)
+                    val buffer = ByteArray(if (SettingsRepository.settings.value.bandwidthLimitBytesPerSecond > 0L) 64 * 1024 else 512 * 1024)
                     while (!control.stopped.get()) {
                         val read = input.read(buffer)
                         if (read == -1) break
@@ -757,7 +786,7 @@ class DownloadService : Service() {
     private fun sha256(file: File): String {
         val digest = MessageDigest.getInstance("SHA-256")
         BufferedInputStream(FileInputStream(file), 256 * 1024).use { input ->
-            val buffer = ByteArray(1024 * 1024)
+            val buffer = ByteArray(512 * 1024)
             while (true) {
                 val read = input.read(buffer)
                 if (read == -1) break
@@ -895,6 +924,7 @@ class DownloadService : Service() {
     }
 
     override fun onDestroy() {
+        serviceRunning.set(false)
         shuttingDown.set(true)
         active.forEach { (_, control) -> control.pause() }
         torrentEngine.stopAsync()
@@ -923,7 +953,9 @@ class DownloadService : Service() {
         private const val ACTION_CANCEL = "manager.action.CANCEL"
         private const val ACTION_PAUSE_ALL = "manager.action.PAUSE_ALL"
         private const val ACTION_RESUME_ALL = "manager.action.RESUME_ALL"
+        private const val ACTION_REFRESH_SETTINGS = "manager.action.REFRESH_SETTINGS"
         private const val EXTRA_ID = "download_id"
+        private val serviceRunning = AtomicBoolean(false)
 
         fun process(context: Context) = send(context, ACTION_PROCESS)
         fun pause(context: Context, id: String) = send(context, ACTION_PAUSE, id)
@@ -932,10 +964,17 @@ class DownloadService : Service() {
         fun pauseAll(context: Context) = send(context, ACTION_PAUSE_ALL)
         fun resumeAll(context: Context) = send(context, ACTION_RESUME_ALL)
 
+        fun refreshSettings(context: Context) {
+            if (!serviceRunning.get()) return
+            val intent = Intent(context.applicationContext, DownloadService::class.java)
+                .setAction(ACTION_REFRESH_SETTINGS)
+            runCatching { context.applicationContext.startService(intent) }
+        }
+
         private fun send(context: Context, action: String, id: String? = null) {
-            val intent = Intent(context, DownloadService::class.java).setAction(action)
+            val intent = Intent(context.applicationContext, DownloadService::class.java).setAction(action)
             if (id != null) intent.putExtra(EXTRA_ID, id)
-            ContextCompat.startForegroundService(context, intent)
+            runCatching { ContextCompat.startForegroundService(context.applicationContext, intent) }
         }
     }
 }

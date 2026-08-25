@@ -4,11 +4,7 @@ import android.annotation.SuppressLint
 import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
-import android.os.Handler
-import android.os.Looper
-import android.os.Message
 import android.webkit.CookieManager
-import android.webkit.JavascriptInterface
 import android.webkit.ServiceWorkerClient
 import android.webkit.ServiceWorkerController
 import android.webkit.URLUtil
@@ -58,7 +54,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.focus.FocusManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.input.ImeAction
@@ -69,6 +64,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import com.managerdownloader.app.browser.ContentBlocker
 import com.managerdownloader.app.data.SearchEngine
 import com.managerdownloader.app.data.SettingsRepository
+import org.json.JSONArray
 
 private data class DetectedDownload(
     val url: String,
@@ -76,19 +72,6 @@ private data class DetectedDownload(
     val cookie: String?,
     val userAgent: String?
 )
-
-private class MediaBridge(
-    private val onMedia: (String) -> Unit
-) {
-    private val main = Handler(Looper.getMainLooper())
-
-    @JavascriptInterface
-    fun onMedia(url: String?) {
-        val clean = url?.trim().orEmpty()
-        if (!clean.startsWith("http://", true) && !clean.startsWith("https://", true)) return
-        main.post { onMedia(clean) }
-    }
-}
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
@@ -118,7 +101,7 @@ fun BrowserScreen(
         if (!SettingsRepository.settings.value.mediaSnifferEnabled) return
         if (mediaDetected.none { it.url == item.url }) {
             mediaDetected.add(item)
-            while (mediaDetected.size > 40) mediaDetected.removeAt(0)
+            while (mediaDetected.size > 16) mediaDetected.removeAt(0)
         }
     }
 
@@ -318,8 +301,8 @@ fun BrowserScreen(
                     this.settings.databaseEnabled = true
                     this.settings.allowFileAccess = false
                     this.settings.allowContentAccess = true
-                    this.settings.setSupportMultipleWindows(true)
-                    this.settings.javaScriptCanOpenWindowsAutomatically = true
+                    this.settings.setSupportMultipleWindows(false)
+                    this.settings.javaScriptCanOpenWindowsAutomatically = false
                     this.settings.mediaPlaybackRequiresUserGesture = true
                     this.settings.builtInZoomControls = true
                     this.settings.displayZoomControls = false
@@ -342,12 +325,6 @@ fun BrowserScreen(
                     }
                     setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_BOUND, false)
 
-                    val owner = this
-                    addJavascriptInterface(
-                        MediaBridge { url -> rememberMedia(detectedItem(url, owner)) },
-                        "ManagerMediaBridge"
-                    )
-
                     webChromeClient = object : WebChromeClient() {
                         override fun onProgressChanged(view: WebView?, newProgress: Int) {
                             progress = newProgress.coerceIn(0, 100)
@@ -357,25 +334,6 @@ fun BrowserScreen(
                             pageTitle = title?.takeIf { it.isNotBlank() } ?: "Navegador"
                         }
 
-                        override fun onCreateWindow(
-                            view: WebView?,
-                            isDialog: Boolean,
-                            isUserGesture: Boolean,
-                            resultMsg: Message
-                        ): Boolean {
-                            val transport = resultMsg.obj as? WebView.WebViewTransport ?: return false
-                            val child = WebView(context)
-                            child.webViewClient = object : WebViewClient() {
-                                override fun onPageStarted(v: WebView, url: String, favicon: Bitmap?) {
-                                    owner.loadUrl(url)
-                                    v.stopLoading()
-                                    v.destroy()
-                                }
-                            }
-                            transport.webView = child
-                            resultMsg.sendToTarget()
-                            return true
-                        }
                     }
 
                     webViewClient = object : WebViewClient() {
@@ -386,8 +344,9 @@ fun BrowserScreen(
                             val url = request?.url?.toString()
                             if (
                                 SettingsRepository.settings.value.mediaSnifferEnabled &&
+                                request?.isForMainFrame != true &&
                                 url != null &&
-                                isDirectMediaUrl(url)
+                                isLikelyMediaUrl(url)
                             ) {
                                 view?.post { rememberMedia(detectedItem(url, view)) }
                             }
@@ -431,7 +390,16 @@ fun BrowserScreen(
                             canGoForward = view.canGoForward()
                             ContentBlocker.setActivePage(url)
                             if (SettingsRepository.settings.value.mediaSnifferEnabled) {
-                                view.evaluateJavascript(MEDIA_SNIFFER_SCRIPT, null)
+                                scanMediaFromDom(view, url) { mediaUrl ->
+                                    rememberMedia(detectedItem(mediaUrl, view))
+                                }
+                                view.postDelayed({
+                                    if (view.isAttachedToWindow && view.url == url && SettingsRepository.settings.value.mediaSnifferEnabled) {
+                                        scanMediaFromDom(view, url) { mediaUrl ->
+                                            rememberMedia(detectedItem(mediaUrl, view))
+                                        }
+                                    }
+                                }, 1500L)
                             }
                         }
 
@@ -472,8 +440,7 @@ fun BrowserScreen(
                                 SettingsRepository.settings.value.mediaSnifferEnabled &&
                                 (mimeType?.startsWith("video/") == true ||
                                     mimeType?.startsWith("audio/") == true ||
-                                    mimeType?.startsWith("image/") == true ||
-                                    isDirectMediaUrl(url))
+                                    isLikelyMediaUrl(url))
                             ) {
                                 rememberMedia(item)
                             }
@@ -504,7 +471,6 @@ fun BrowserScreen(
         onDispose {
             ContentBlocker.setActivePage(null)
             webView?.stopLoading()
-            webView?.removeJavascriptInterface("ManagerMediaBridge")
             webView?.destroy()
             webView = null
         }
@@ -517,7 +483,7 @@ fun BrowserScreen(
             text = {
                 Column {
                     Text(
-                        "Enlaces HTTP/HTTPS de video, audio e imagen observados por el navegador y el DOM. No intenta romper DRM ni descargar blob: internos.",
+                        "Enlaces HTTP/HTTPS de video y audio detectados por el reproductor o por URLs multimedia. Se omiten imágenes, iconos y recursos decorativos. No intenta romper DRM ni descargar blob: internos.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -611,15 +577,14 @@ private fun isDownloadableScheme(url: String): Boolean =
         url.startsWith("https://", true) ||
         url.startsWith("magnet:", true)
 
-private fun isDirectMediaUrl(url: String): Boolean {
+private fun isLikelyMediaUrl(url: String): Boolean {
     val clean = url.substringBefore('#').substringBefore('?').lowercase()
-    return DIRECT_MEDIA_EXTENSIONS.any { clean.endsWith(it) }
+    return MEDIA_EXTENSIONS.any { clean.endsWith(it) }
 }
 
-private val DIRECT_MEDIA_EXTENSIONS = setOf(
-    ".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".3gp", ".ts",
-    ".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".opus",
-    ".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"
+private val MEDIA_EXTENSIONS = setOf(
+    ".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".3gp",
+    ".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".opus"
 )
 
 private fun browserUrl(value: String, engine: SearchEngine): String {
@@ -676,37 +641,52 @@ private fun openExternal(context: android.content.Context, url: String) {
 
 private val IPV4_REGEX = Regex("""^(?:\\d{1,3}\\.){3}\\d{1,3}(?::\\d+)?$""")
 
+private fun scanMediaFromDom(
+    view: WebView,
+    expectedPageUrl: String,
+    onMedia: (String) -> Unit
+) {
+    if (!view.isAttachedToWindow) return
+    runCatching {
+        view.evaluateJavascript(MEDIA_SNIFFER_SCRIPT) { raw ->
+            if (view.url != expectedPageUrl || raw.isNullOrBlank() || raw == "null") return@evaluateJavascript
+            val array = runCatching { JSONArray(raw) }.getOrNull() ?: return@evaluateJavascript
+            val count = minOf(array.length(), 12)
+            for (index in 0 until count) {
+                val url = array.optString(index).trim()
+                if (url.startsWith("http://", true) || url.startsWith("https://", true)) {
+                    onMedia(url)
+                }
+            }
+        }
+    }
+}
+
 private const val MEDIA_SNIFFER_SCRIPT = """
 (function() {
   try {
-    if (window.__managerDownloaderSnifferInstalled) {
-      if (window.__managerDownloaderScan) window.__managerDownloaderScan();
-      return;
-    }
-    window.__managerDownloaderSnifferInstalled = true;
-    const mediaRx = /\\.(mp4|mkv|webm|avi|mov|m4v|3gp|ts|mp3|m4a|aac|flac|wav|ogg|opus|jpg|jpeg|png|webp|gif|avif)(?:$|[?#])/i;
-    const send = function(raw) {
+    const found = [];
+    const seen = new Set();
+    const mediaRx = /\.(mp4|mkv|webm|avi|mov|m4v|3gp|mp3|m4a|aac|flac|wav|ogg|opus)(?:$|[?#])/i;
+    const add = function(raw) {
       try {
         if (!raw || raw.indexOf('blob:') === 0 || raw.indexOf('data:') === 0) return;
         const absolute = new URL(raw, document.baseURI).href;
-        if (/^https?:/i.test(absolute)) ManagerMediaBridge.onMedia(absolute);
+        if (!/^https?:/i.test(absolute) || seen.has(absolute)) return;
+        seen.add(absolute);
+        found.push(absolute);
       } catch (_) {}
     };
-    const scan = function() {
-      document.querySelectorAll('video,audio,source').forEach(function(el) {
-        send(el.currentSrc || el.src || el.getAttribute('src'));
-      });
-      document.querySelectorAll('a[href]').forEach(function(el) {
-        const href = el.href || el.getAttribute('href');
-        if (el.hasAttribute('download') || mediaRx.test(href || '')) send(href);
-      });
-    };
-    window.__managerDownloaderScan = scan;
-    scan();
-    const observer = new MutationObserver(function() { scan(); });
-    observer.observe(document.documentElement || document.body, {childList:true, subtree:true, attributes:true, attributeFilter:['src','href']});
-    setTimeout(scan, 900);
-    setTimeout(scan, 2500);
-  } catch (_) {}
+    document.querySelectorAll('video,audio,source').forEach(function(el) {
+      add(el.currentSrc || el.src || el.getAttribute('src'));
+    });
+    document.querySelectorAll('a[href]').forEach(function(el) {
+      const href = el.href || el.getAttribute('href');
+      if (mediaRx.test(href || '')) add(href);
+    });
+    return found.slice(0, 12);
+  } catch (_) {
+    return [];
+  }
 })();
 """

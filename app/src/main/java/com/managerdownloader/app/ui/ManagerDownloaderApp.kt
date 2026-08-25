@@ -81,7 +81,7 @@ fun ManagerDownloaderApp(
 
                 else -> SettingsScreen(
                     contentPadding = padding,
-                    onTransferSettingsChanged = { DownloadService.process(context) },
+                    onTransferSettingsChanged = { DownloadService.refreshSettings(context) },
                     onSelectDownloadFolder = onSelectDownloadFolder
                 )
             }

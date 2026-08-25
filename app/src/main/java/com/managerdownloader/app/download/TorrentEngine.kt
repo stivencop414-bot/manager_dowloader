@@ -37,10 +37,7 @@ internal class TorrentEngine(
             manager.maxPeers(500)
         }
         manager.maxActiveDownloads(maxActive.coerceAtLeast(1))
-        val limit = SettingsRepository.settings.value.bandwidthLimitBytesPerSecond
-            .coerceAtMost(Int.MAX_VALUE.toLong())
-            .toInt()
-        manager.downloadRateLimit(limit)
+        applyDownloadRateLimit()
     }
 
     fun download(task: DownloadTask, control: TransferControl, maxActive: Int) {
@@ -75,10 +72,7 @@ internal class TorrentEngine(
 
         try {
             while (!control.stopped.get()) {
-                val desiredLimit = SettingsRepository.settings.value.bandwidthLimitBytesPerSecond
-                    .coerceAtMost(Int.MAX_VALUE.toLong())
-                    .toInt()
-                if (manager.downloadRateLimit() != desiredLimit) manager.downloadRateLimit(desiredLimit)
+                applyDownloadRateLimit()
 
                 val current = DownloadRepository.find(task.id) ?: return
                 if (current.status == DownloadStatus.PAUSED) {
@@ -131,6 +125,17 @@ internal class TorrentEngine(
                 runCatching { manager.remove(torrentHandle) }
                 handles.remove(task.id)
                 deleteRecursivelySafe(saveDir)
+            }
+        }
+    }
+
+    private fun applyDownloadRateLimit() {
+        val desiredLimit = SettingsRepository.settings.value.bandwidthLimitBytesPerSecond
+            .coerceIn(0L, Int.MAX_VALUE.toLong())
+            .toInt()
+        runCatching {
+            if (manager.downloadRateLimit() != desiredLimit) {
+                manager.downloadRateLimit(desiredLimit)
             }
         }
     }

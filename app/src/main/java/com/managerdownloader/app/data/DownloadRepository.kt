@@ -289,7 +289,7 @@ object DownloadRepository {
                 }
             )
         }
-        queueFile().writeText(array.toString())
+        runCatching { queueFile().writeText(array.toString()) }
     }
 
     private fun load(): List<DownloadTask> {

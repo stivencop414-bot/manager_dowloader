@@ -1,13 +1,16 @@
-# v0.6 audit
+# Auditoría v0.6.2
 
-Esta versión parte del motor v0.5.2 y se concentra en cuatro problemas observados durante pruebas reales: búsqueda de Google en WebView, páginas en blanco con AdBlock, falta de acciones sobre archivos terminados y rendimiento HTTP.
+Base: v0.6.1 confirmada en `main`.
 
-## Decisiones
-- El User-Agent de compatibilidad se instala antes de la primera navegación.
-- El AdBlock Estándar no intercepta el documento principal, POST ni recursos same-site.
-- Se conserva un modo Estricto como opción explícita.
-- Se añaden acciones de archivo usando content URI/FileProvider y SAF.
-- El motor HTTP elimina contención en el limitador ilimitado, usa buffers mayores, segmentación hasta 16 conexiones y reintentos resumibles.
+Objetivo de esta revisión: reducir cierres de ejecución observados al cambiar ajustes, limitar velocidad y utilizar el detector multimedia.
 
-## Validación
-El workflow de upgrade compila `assembleDebug` antes de hacer commit a `main`. Si la compilación falla, la fuente vigente en `main` no se reemplaza.
+Cambios de riesgo reducido:
+- no cambia el modelo persistido de descargas;
+- no borra parciales ni historial;
+- no modifica la estructura de carpetas;
+- mantiene HTTP Range, reanudación, torrent y SAF;
+- reemplaza el limitador de ancho de banda por una implementación acotada;
+- evita iniciar el servicio desde Ajustes si el servicio no está activo;
+- elimina el escaneo DOM continuo y las imágenes del detector de medios.
+
+El workflow de instalación debe compilar `assembleDebug` antes de modificar `main`.
