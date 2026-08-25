@@ -31,7 +31,7 @@ enum class AdBlockMode {
 data class TransferSettings(
     val queueMode: QueueMode = QueueMode.SEQUENTIAL,
     val maxParallelDownloads: Int = 3,
-    val segmentsPerFile: Int = 8,
+    val segmentsPerFile: Int = 6,
     val turboMode: Boolean = true,
     val segmentRetryCount: Int = 2,
     val adBlockEnabled: Boolean = true,
@@ -86,7 +86,7 @@ object SettingsRepository {
                 QueueMode.valueOf(prefs.getString(KEY_QUEUE_MODE, QueueMode.SEQUENTIAL.name)!!)
             }.getOrDefault(QueueMode.SEQUENTIAL),
             maxParallelDownloads = prefs.getInt(KEY_MAX_PARALLEL, 3).coerceIn(2, 6),
-            segmentsPerFile = prefs.getInt(KEY_SEGMENTS, 8).coerceIn(1, 16),
+            segmentsPerFile = prefs.getInt(KEY_SEGMENTS, 6).coerceIn(1, 8),
             turboMode = prefs.getBoolean(KEY_TURBO, true),
             segmentRetryCount = prefs.getInt(KEY_RETRIES, 2).coerceIn(0, 5),
             adBlockEnabled = prefs.getBoolean(KEY_ADBLOCK, true),
@@ -115,7 +115,7 @@ object SettingsRepository {
         update { it.copy(maxParallelDownloads = value.coerceIn(2, 6)) }
 
     fun setSegmentsPerFile(value: Int) =
-        update { it.copy(segmentsPerFile = value.coerceIn(1, 16)) }
+        update { it.copy(segmentsPerFile = value.coerceIn(1, 8)) }
 
     fun setTurboMode(value: Boolean) = update { it.copy(turboMode = value) }
 

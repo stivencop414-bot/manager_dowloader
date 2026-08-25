@@ -1,18 +1,12 @@
-# Auditoría v0.7.0
+# Auditoría v0.7.1
 
-Base: v0.6.2 confirmada en `main`.
+Base: v0.7.0 confirmada en `main` (commit 2cd63d15c8854dad19f5bbf89daa00eb5b568733).
 
-Objetivo: corregir los falsos `.txt` y dar a YouTube un flujo dedicado, sin volver a hacer agresivo el sniffer genérico.
+Esta revisión toma del informe de optimización los cambios de rendimiento que encajan con el motor actual sin reemplazar toda la arquitectura:
+- techo móvil de 6–8 conexiones HTTP;
+- buffers directos y FileChannel;
+- límites de red/torrent más conservadores;
+- menor frecuencia de notificaciones;
+- monitor de red y onTimeout ya existentes se conservan.
 
-Decisiones:
-- NewPipe Extractor se usa solo para extracción de metadatos/streams; no se inicializa en el arranque de la app.
-- La página HTML de YouTube nunca se envía al motor HTTP como descarga.
-- `ACTION_SEND text/plain` permite recibir enlaces desde el Share Sheet de Android.
-- Los streams combinados video+audio y audio-only pueden ir al motor HTTP existente.
-- Las pistas video-only se informan pero no se fusionan todavía.
-- WebView captura pérdida del renderer para evitar cierres completos.
-
-Compatibilidad:
-- minSdk 26 requiere core library desugaring para NewPipeExtractor.
-- JitPack se añade como repositorio exclusivamente para NewPipeExtractor.
-- NewPipeExtractor es GPL-3.0-or-later; revisar obligaciones de licencia antes de distribuir binarios públicos.
+Se difieren Koin/Room/UIDT, preasignación `posix_fallocate` y streaming torrent porque requieren cambiar el modelo de persistencia/partial files o añadir una nueva capa de reproducción.

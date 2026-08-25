@@ -33,10 +33,10 @@ internal class TorrentEngine(
             manager.start()
             // Download-manager behavior: don't intentionally keep finished torrents seeding.
             manager.maxActiveSeeds(0)
-            manager.maxConnections(300)
-            manager.maxPeers(500)
+            manager.maxConnections(150)
+            manager.maxPeers(300)
         }
-        manager.maxActiveDownloads(maxActive.coerceAtLeast(1))
+        manager.maxActiveDownloads(maxActive.coerceIn(1, 4))
         applyDownloadRateLimit()
     }
 
@@ -191,11 +191,15 @@ internal class TorrentEngine(
                 task.userAgent?.takeIf { it.isNotBlank() }?.let { requestBuilder.header("User-Agent", it) }
                 val call = httpClient.newCall(requestBuilder.build())
                 control.calls.add(call)
-                call.execute().use { response ->
-                    if (!response.isSuccessful) throw IOException("HTTP ${response.code} al obtener .torrent")
-                    val bytes = response.body?.byteStream()?.use { it.readBytesLimited(MAX_TORRENT_METADATA_BYTES) }
-                        ?: throw IOException("Archivo .torrent vacío")
-                    TorrentInfo(bytes)
+                try {
+                    call.execute().use { response ->
+                        if (!response.isSuccessful) throw IOException("HTTP ${response.code} al obtener .torrent")
+                        val bytes = response.body?.byteStream()?.use { it.readBytesLimited(MAX_TORRENT_METADATA_BYTES) }
+                            ?: throw IOException("Archivo .torrent vacío")
+                        TorrentInfo(bytes)
+                    }
+                } finally {
+                    control.calls.remove(call)
                 }
             }
         }

@@ -147,7 +147,7 @@ fun SettingsScreen(
 
             Text("Conexiones máximas por archivo: ${segmentsDraft.roundToInt()}", fontWeight = FontWeight.SemiBold)
             Text(
-                "Se usan solo cuando el servidor acepta HTTP Range. En modo Turbo el motor puede llegar hasta 16 segmentos en archivos grandes.",
+                "Se usan solo cuando el servidor acepta HTTP Range. Para móviles se limita a 8 conexiones; 4–6 suele dar el mejor equilibrio entre velocidad, temperatura y estabilidad.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 fontSize = 12.sp
             )
@@ -158,8 +158,8 @@ fun SettingsScreen(
                     SettingsRepository.setSegmentsPerFile(segmentsDraft.roundToInt())
                     onTransferSettingsChanged()
                 },
-                valueRange = 1f..16f,
-                steps = 14
+                valueRange = 1f..8f,
+                steps = 6
             )
 
             Spacer(Modifier.height(8.dp))

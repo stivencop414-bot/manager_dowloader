@@ -32,6 +32,8 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.io.RandomAccessFile
 import java.security.MessageDigest
+import java.nio.ByteBuffer
+import java.nio.channels.Channels
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
@@ -125,13 +127,14 @@ private class SharedBandwidthLimiter(
 
 class DownloadService : Service() {
     private val transferExecutor = Executors.newCachedThreadPool()
-    private val segmentExecutor = Executors.newFixedThreadPool(16)
+    private val segmentExecutor = Executors.newFixedThreadPool(8)
     private val schedulerLock = Any()
     private val active = ConcurrentHashMap<String, TransferControl>()
     private val shuttingDown = AtomicBoolean(false)
     private val bandwidthLimiter = SharedBandwidthLimiter {
         SettingsRepository.settings.value.bandwidthLimitBytesPerSecond
     }
+    private val lastNotificationUpdate = AtomicLong(0L)
     private lateinit var connectivityManager: ConnectivityManager
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
@@ -149,12 +152,12 @@ class DownloadService : Service() {
 
     private val httpDispatcher = Dispatcher().apply {
         maxRequests = 32
-        maxRequestsPerHost = 16
+        maxRequestsPerHost = 8
     }
 
     private val client = OkHttpClient.Builder()
         .dispatcher(httpDispatcher)
-        .connectionPool(ConnectionPool(24, 5, java.util.concurrent.TimeUnit.MINUTES))
+        .connectionPool(ConnectionPool(12, 5, java.util.concurrent.TimeUnit.MINUTES))
         .followRedirects(true)
         .followSslRedirects(true)
         .retryOnConnectionFailure(true)
@@ -322,6 +325,7 @@ class DownloadService : Service() {
         val safeFilename = DownloadRepository.find(task.id)?.filename ?: task.filename
         val requestedSegments = SettingsRepository.settings.value.segmentsPerFile
         val segmentCount = chooseSegmentCount(probe.totalBytes, requestedSegments, probe.supportsRanges)
+        ensureEnoughWorkingSpace(task.id, probe.totalBytes)
 
         if (segmentCount > 1 && probe.totalBytes > 0) {
             downloadSegmented(
@@ -353,11 +357,12 @@ class DownloadService : Service() {
         val call = client.newCall(builder.build())
         control.calls.add(call)
 
-        return call.execute().use { response ->
-            if (control.stopped.get()) throw IOException("Transferencia detenida")
-            if (!response.isSuccessful && response.code != 416) {
-                throw IOException("HTTP ${response.code}")
-            }
+        try {
+            return call.execute().use { response ->
+                if (control.stopped.get()) throw IOException("Transferencia detenida")
+                if (!response.isSuccessful && response.code != 416) {
+                    throw IOException("HTTP ${response.code}")
+                }
 
             val contentRange = response.header("Content-Range")
             val rangeTotal = contentRange
@@ -383,35 +388,38 @@ class DownloadService : Service() {
                 ?.takeIf { !it.trimStart().startsWith("W/", ignoreCase = true) }
             val validator = etag ?: response.header("Last-Modified")
 
-            HttpProbe(
-                supportsRanges = supportsRanges,
-                totalBytes = total,
-                filename = guessed,
-                validator = validator
-            )
+                HttpProbe(
+                    supportsRanges = supportsRanges,
+                    totalBytes = total,
+                    filename = guessed,
+                    validator = validator
+                )
+            }
+        } finally {
+            control.calls.remove(call)
         }
     }
 
     private fun chooseSegmentCount(total: Long, requested: Int, rangeSupported: Boolean): Int {
         if (!rangeSupported || total <= 0L) return 1
         val settings = SettingsRepository.settings.value
-        val desired = requested.coerceIn(1, 16)
+        // On mobile, more than 6–8 parallel ranges usually adds radio/CPU/thermal overhead
+        // without improving throughput. Keep a hard ceiling of 8.
+        val desired = requested.coerceIn(1, 8)
         return if (settings.turboMode) {
-            when {
-                total < 4L * 1024L * 1024L -> 1
-                total < 16L * 1024L * 1024L -> desired.coerceAtMost(2)
-                total < 64L * 1024L * 1024L -> desired.coerceAtMost(4)
-                total < 256L * 1024L * 1024L -> desired.coerceAtMost(8)
-                total < 1024L * 1024L * 1024L -> desired.coerceAtMost(12)
-                else -> desired
-            }
-        } else {
             when {
                 total < 8L * 1024L * 1024L -> 1
                 total < 32L * 1024L * 1024L -> desired.coerceAtMost(2)
                 total < 128L * 1024L * 1024L -> desired.coerceAtMost(4)
-                total < 512L * 1024L * 1024L -> desired.coerceAtMost(8)
-                else -> desired.coerceAtMost(12)
+                total < 512L * 1024L * 1024L -> desired.coerceAtMost(6)
+                else -> desired.coerceAtMost(8)
+            }
+        } else {
+            when {
+                total < 16L * 1024L * 1024L -> 1
+                total < 64L * 1024L * 1024L -> desired.coerceAtMost(2)
+                total < 256L * 1024L * 1024L -> desired.coerceAtMost(4)
+                else -> desired.coerceAtMost(6)
             }
         }
     }
@@ -553,46 +561,55 @@ class DownloadService : Service() {
 
         val call = client.newCall(builder.build())
         control.calls.add(call)
+        try {
+            call.execute().use { response ->
+                if (response.code != 206) throw IOException("El servidor dejó de aceptar rangos (HTTP ${response.code})")
+                val body = response.body ?: throw IOException("Respuesta sin contenido")
 
-        call.execute().use { response ->
-            if (response.code != 206) throw IOException("El servidor dejó de aceptar rangos (HTTP ${response.code})")
-            val body = response.body ?: throw IOException("Respuesta sin contenido")
+                RandomAccessFile(file, "rw").use { output ->
+                    val fileChannel = output.channel
+                    fileChannel.position(existing)
+                    body.byteStream().use { input ->
+                        val inputChannel = Channels.newChannel(input)
+                        val bufferSize = if (SettingsRepository.settings.value.bandwidthLimitBytesPerSecond > 0L) 64 * 1024 else 128 * 1024
+                        val buffer = ByteBuffer.allocateDirect(bufferSize)
+                        while (!control.stopped.get()) {
+                            buffer.clear()
+                            val read = inputChannel.read(buffer)
+                            if (read == -1) break
+                            if (read == 0) continue
+                            if (!ensureNetworkPolicy(task.id, control)) break
+                            bandwidthLimiter.acquire(read)
+                            buffer.flip()
+                            while (buffer.hasRemaining()) fileChannel.write(buffer)
+                            progress.addAndGet(index, read.toLong())
 
-            RandomAccessFile(file, "rw").use { output ->
-                output.seek(existing)
-                body.byteStream().use { input ->
-                    val buffer = ByteArray(if (SettingsRepository.settings.value.bandwidthLimitBytesPerSecond > 0L) 64 * 1024 else 128 * 1024)
-                    while (!control.stopped.get()) {
-                        val read = input.read(buffer)
-                        if (read == -1) break
-                        if (!ensureNetworkPolicy(task.id, control)) break
-                        bandwidthLimiter.acquire(read)
-                        output.write(buffer, 0, read)
-                        progress.addAndGet(index, read.toLong())
-
-                        val now = System.currentTimeMillis()
-                        if (now - lastUpdate.get() >= 800L) {
-                            synchronized(progressLock) {
-                                if (now - lastUpdate.get() >= 800L) {
-                                    val downloaded = (0 until segmentCount).sumOf { progress.get(it) }
-                                    val previousBytes = lastBytes.getAndSet(downloaded)
-                                    val previousTime = lastUpdate.getAndSet(now)
-                                    val elapsed = (now - previousTime).coerceAtLeast(1L)
-                                    val speed = ((downloaded - previousBytes).coerceAtLeast(0L) * 1000L) / elapsed
-                                    DownloadRepository.updateProgress(
-                                        task.id,
-                                        downloaded,
-                                        totalBytes,
-                                        speed,
-                                        "$segmentCount conexiones activas"
-                                    )
-                                    updateAggregateNotification()
+                            val now = System.currentTimeMillis()
+                            if (now - lastUpdate.get() >= 500L) {
+                                synchronized(progressLock) {
+                                    if (now - lastUpdate.get() >= 500L) {
+                                        val downloaded = (0 until segmentCount).sumOf { progress.get(it) }
+                                        val previousBytes = lastBytes.getAndSet(downloaded)
+                                        val previousTime = lastUpdate.getAndSet(now)
+                                        val elapsed = (now - previousTime).coerceAtLeast(1L)
+                                        val speed = ((downloaded - previousBytes).coerceAtLeast(0L) * 1000L) / elapsed
+                                        DownloadRepository.updateProgress(
+                                            task.id,
+                                            downloaded,
+                                            totalBytes,
+                                            speed,
+                                            "$segmentCount conexiones activas"
+                                        )
+                                        updateAggregateNotificationThrottled(now)
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
+        } finally {
+            control.calls.remove(call)
         }
 
         if (!control.stopped.get() && file.length() < segment.length) {
@@ -634,72 +651,82 @@ class DownloadService : Service() {
 
         val call = client.newCall(builder.build())
         control.calls.add(call)
+        try {
+            call.execute().use { response ->
+                if (!response.isSuccessful) throw IOException("HTTP ${response.code}")
+                val body = response.body ?: throw IOException("Respuesta sin contenido")
 
-        call.execute().use { response ->
-            if (!response.isSuccessful) throw IOException("HTTP ${response.code}")
-            val body = response.body ?: throw IOException("Respuesta sin contenido")
+                if (existing > 0 && response.code == 200) {
+                    RandomAccessFile(partial, "rw").use { it.setLength(0L) }
+                    existing = 0L
+                }
 
-            if (existing > 0 && response.code == 200) {
-                RandomAccessFile(partial, "rw").use { it.setLength(0L) }
-                existing = 0L
-            }
+                val filename = URLUtil.guessFileName(
+                    response.request.url.toString(),
+                    response.header("Content-Disposition"),
+                    response.header("Content-Type")
+                ).takeIf { it.isNotBlank() } ?: task.filename
 
-            val filename = URLUtil.guessFileName(
-                response.request.url.toString(),
-                response.header("Content-Disposition"),
-                response.header("Content-Type")
-            ).takeIf { it.isNotBlank() } ?: task.filename
+                val total = resolveTotalBytes(response, existing)
+                DownloadRepository.updateMetadata(task.id, filename = filename, totalBytes = total.takeIf { it > 0 })
+                ensureEnoughWorkingSpace(task.id, total)
 
-            val total = resolveTotalBytes(response, existing)
-            DownloadRepository.updateMetadata(task.id, filename = filename, totalBytes = total.takeIf { it > 0 })
+                var downloaded = existing
+                var lastBytes = downloaded
+                var lastTime = System.currentTimeMillis()
 
-            var downloaded = existing
-            var lastBytes = downloaded
-            var lastTime = System.currentTimeMillis()
+                RandomAccessFile(partial, "rw").use { output ->
+                    val fileChannel = output.channel
+                    fileChannel.position(existing)
+                    body.byteStream().use { input ->
+                        val inputChannel = Channels.newChannel(input)
+                        val bufferSize = if (SettingsRepository.settings.value.bandwidthLimitBytesPerSecond > 0L) 64 * 1024 else 256 * 1024
+                        val buffer = ByteBuffer.allocateDirect(bufferSize)
+                        while (!control.stopped.get()) {
+                            buffer.clear()
+                            val read = inputChannel.read(buffer)
+                            if (read == -1) break
+                            if (read == 0) continue
+                            if (!ensureNetworkPolicy(task.id, control)) break
+                            bandwidthLimiter.acquire(read)
+                            buffer.flip()
+                            while (buffer.hasRemaining()) fileChannel.write(buffer)
+                            downloaded += read
 
-            RandomAccessFile(partial, "rw").use { output ->
-                output.seek(existing)
-                body.byteStream().use { input ->
-                    val buffer = ByteArray(if (SettingsRepository.settings.value.bandwidthLimitBytesPerSecond > 0L) 64 * 1024 else 512 * 1024)
-                    while (!control.stopped.get()) {
-                        val read = input.read(buffer)
-                        if (read == -1) break
-                        if (!ensureNetworkPolicy(task.id, control)) break
-                        bandwidthLimiter.acquire(read)
-                        output.write(buffer, 0, read)
-                        downloaded += read
-
-                        val now = System.currentTimeMillis()
-                        if (now - lastTime >= 800L) {
-                            val speed = ((downloaded - lastBytes) * 1000L) / (now - lastTime).coerceAtLeast(1L)
-                            DownloadRepository.updateProgress(task.id, downloaded, total, speed, "1 conexión")
-                            updateAggregateNotification()
-                            lastBytes = downloaded
-                            lastTime = now
+                            val now = System.currentTimeMillis()
+                            if (now - lastTime >= 500L) {
+                                val speed = ((downloaded - lastBytes) * 1000L) / (now - lastTime).coerceAtLeast(1L)
+                                DownloadRepository.updateProgress(task.id, downloaded, total, speed, "1 conexión")
+                                updateAggregateNotificationThrottled(now)
+                                lastBytes = downloaded
+                                lastTime = now
+                            }
                         }
                     }
                 }
+
+                if (control.stopped.get()) return@use
+
+                val currentName = DownloadRepository.find(task.id)?.filename ?: filename
+                val finalFile = uniqueFinalFile(currentName)
+                if (!partial.renameTo(finalFile)) {
+                    partial.copyTo(finalFile, overwrite = false)
+                    partial.delete()
+                }
+
+                verifySha256IfRequested(task.id, finalFile, restoreTo = partial)
+                val completedBytes = finalFile.length()
+                val publishedPath = StorageRepository.publishFile(
+                    finalFile,
+                    currentName,
+                    downloadsDirectory()
+                )
+                DownloadRepository.markCompleted(task.id, publishedPath, completedBytes)
+                runCatching { singleMetaFile(task.id).delete() }
+                showCompletedNotification(currentName)
             }
-
-            if (control.stopped.get()) return@use
-
-            val currentName = DownloadRepository.find(task.id)?.filename ?: filename
-            val finalFile = uniqueFinalFile(currentName)
-            if (!partial.renameTo(finalFile)) {
-                partial.copyTo(finalFile, overwrite = false)
-                partial.delete()
-            }
-
-            verifySha256IfRequested(task.id, finalFile, restoreTo = partial)
-            val completedBytes = finalFile.length()
-            val publishedPath = StorageRepository.publishFile(
-                finalFile,
-                currentName,
-                downloadsDirectory()
-            )
-            DownloadRepository.markCompleted(task.id, publishedPath, completedBytes)
-            runCatching { singleMetaFile(task.id).delete() }
-            showCompletedNotification(currentName)
+        } finally {
+            control.calls.remove(call)
         }
     }
 
@@ -750,6 +777,29 @@ class DownloadService : Service() {
                     input.copyTo(output, 256 * 1024)
                 }
             }
+        }
+    }
+
+    private fun ensureEnoughWorkingSpace(id: String, totalBytes: Long) {
+        if (totalBytes <= 0L) return
+        val dir = downloadsDirectory()
+        val alreadyDownloaded = partialFile(id).takeIf { it.exists() }?.length() ?:
+            dir.listFiles()
+                ?.filter { it.name.startsWith(".$id.seg") }
+                ?.sumOf { it.length() }
+                ?: 0L
+        val remaining = (totalBytes - alreadyDownloaded).coerceAtLeast(0L)
+        val reserve = 32L * 1024L * 1024L
+        if (dir.usableSpace in 1 until (remaining + reserve)) {
+            throw IOException("Espacio insuficiente. Se necesitan aproximadamente ${formatBytes(remaining + reserve)} libres")
+        }
+    }
+
+    private fun updateAggregateNotificationThrottled(now: Long = System.currentTimeMillis()) {
+        val previous = lastNotificationUpdate.get()
+        if (now - previous < 1500L) return
+        if (lastNotificationUpdate.compareAndSet(previous, now)) {
+            updateAggregateNotification()
         }
     }
 
