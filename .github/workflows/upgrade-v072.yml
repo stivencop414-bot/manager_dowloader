@@ -1,0 +1,158 @@
+name: Upgrade Manager Downloader v0.7.2
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  upgrade-build-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout current repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify v0.7.1 base and create backup
+        shell: bash
+        run: |
+          if ! grep -q '?: "0.7.1"' app/build.gradle.kts; then
+            echo "WARNING: main no reporta 0.7.1 antes del upgrade. El workflow seguirá protegido porque compila antes de hacer commit."
+          fi
+          if git ls-remote --exit-code --heads origin pre-v0.7.2 >/dev/null 2>&1; then
+            echo "Backup pre-v0.7.2 ya existe; se conserva sin modificar."
+          else
+            git push origin HEAD:refs/heads/pre-v0.7.2
+          fi
+
+      - name: Extract v0.7.2 source
+        shell: bash
+        run: |
+          rm -rf /tmp/manager-v072
+          mkdir -p /tmp/manager-v072
+          unzip -q manager_downloader_v072_upgrade.zip -d /tmp/manager-v072
+          test -f /tmp/manager-v072/app/build.gradle.kts
+          test -f /tmp/manager-v072/app/src/main/java/com/managerdownloader/app/ui/BrowserScreen.kt
+          test -f /tmp/manager-v072/app/src/main/java/com/managerdownloader/app/download/DownloadService.kt
+
+      - name: Replace application source
+        shell: bash
+        run: |
+          rsync -a --delete \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            /tmp/manager-v072/ ./
+
+      - name: Validate v0.7.2 source markers
+        shell: bash
+        run: |
+          grep -q '?: "0.7.2"' app/build.gradle.kts
+          grep -q 'AtomicReference' app/src/main/java/com/managerdownloader/app/ui/BrowserScreen.kt
+          grep -q 'destroyDeadWebView' app/src/main/java/com/managerdownloader/app/ui/BrowserScreen.kt
+          grep -q 'browserSafeMode' app/src/main/java/com/managerdownloader/app/ui/BrowserScreen.kt
+          grep -q 'ModalBottomSheet' app/src/main/java/com/managerdownloader/app/ui/BrowserScreen.kt
+          grep -q 'MAX_SNIFFER_CALLBACKS_PER_WINDOW' app/src/main/java/com/managerdownloader/app/ui/BrowserScreen.kt
+          grep -q 'android:configChanges=' app/src/main/AndroidManifest.xml
+          grep -q 'task.referer' app/src/main/java/com/managerdownloader/app/download/DownloadService.kt
+          grep -q 'MAX_EASYLIST_HOSTS' app/src/main/java/com/managerdownloader/app/browser/ContentBlocker.kt
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 36
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses || true
+          sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Set up Gradle 9.5
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.5.0"
+
+      - name: Compile v0.7.2 before touching main
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle --no-daemon :app:assembleDebug \
+            -PVERSION_CODE=${{ github.run_number }} \
+            -PVERSION_NAME=0.7.2 2>&1 | tee /tmp/v072-build.log
+
+      - name: Upload compiler log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v072-build-log
+          path: /tmp/v072-build.log
+          if-no-files-found: ignore
+
+      - name: Commit v0.7.2 after successful build
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          echo "Changes that will be committed:"
+          git status --short
+
+          if git diff --cached --quiet; then
+            echo "ERROR: v0.7.2 compiled but produced no source changes."
+            exit 1
+          fi
+
+          git commit -m "Manager Downloader v0.7.2 browser stability batch sniffer"
+          git push origin main
+
+      - name: Prepare direct-download APK
+        shell: bash
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk ManagerDownloader.apk
+
+      - name: Publish latest test APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          git tag -f latest-apk HEAD
+          git push origin latest-apk --force
+
+          if gh release view latest-apk >/dev/null 2>&1; then
+            gh release upload latest-apk ManagerDownloader.apk --clobber
+            gh release edit latest-apk \
+              --title "Manager Downloader - Última APK" \
+              --notes "Última compilación de prueba. Versión 0.7.2."
+          else
+            gh release create latest-apk ManagerDownloader.apk \
+              --title "Manager Downloader - Última APK" \
+              --notes "Última compilación de prueba. Versión 0.7.2." \
+              --prerelease
+          fi
+
+      - name: Publish versioned v0.7.2 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          git tag -f v0.7.2 HEAD
+          git push origin v0.7.2 --force
+
+          if gh release view v0.7.2 >/dev/null 2>&1; then
+            gh release upload v0.7.2 ManagerDownloader.apk --clobber
+            gh release edit v0.7.2 \
+              --title "Manager Downloader v0.7.2" \
+              --notes-file CHANGELOG.md
+          else
+            gh release create v0.7.2 ManagerDownloader.apk \
+              --title "Manager Downloader v0.7.2" \
+              --notes-file CHANGELOG.md \
+              --prerelease
+          fi
