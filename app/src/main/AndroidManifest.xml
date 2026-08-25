@@ -38,6 +38,12 @@
                 <category android:name="android.intent.category.DEFAULT" />
                 <data android:mimeType="application/x-bittorrent" />
             </intent-filter>
+
+            <intent-filter android:label="Abrir con Manager Downloader">
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
         </activity>
 
         <provider

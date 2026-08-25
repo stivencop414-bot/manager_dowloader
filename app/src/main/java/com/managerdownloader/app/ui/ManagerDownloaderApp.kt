@@ -13,6 +13,7 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -29,11 +30,16 @@ import com.managerdownloader.app.download.DownloadService
 fun ManagerDownloaderApp(
     onSelectDownloadFolder: () -> Unit,
     onOpenTorrentFile: () -> Unit,
-    onMoveCompleted: (String) -> Unit
+    onMoveCompleted: (String) -> Unit,
+    incomingBrowserUrl: String? = null,
+    onIncomingBrowserUrlConsumed: () -> Unit = {}
 ) {
     val settings by SettingsRepository.settings.collectAsState()
     ManagerTheme(settings.themeMode) {
         var tab by remember { mutableIntStateOf(0) }
+        LaunchedEffect(incomingBrowserUrl) {
+            if (incomingBrowserUrl != null) tab = 1
+        }
         val context = LocalContext.current
         val selectedTree by StorageRepository.treeUri.collectAsState()
         var showStoragePrompt by remember { mutableStateOf(selectedTree == null && !StorageRepository.wasPrompted()) }
@@ -76,7 +82,9 @@ fun ManagerDownloaderApp(
                     contentPadding = padding,
                     onAdd = { url, name, cookie, userAgent ->
                         enqueue(context, url, name, cookie, userAgent)
-                    }
+                    },
+                    incomingUrl = incomingBrowserUrl,
+                    onIncomingUrlConsumed = onIncomingBrowserUrlConsumed
                 )
 
                 else -> SettingsScreen(

@@ -24,7 +24,7 @@ android {
 
         versionName = providers.gradleProperty("VERSION_NAME")
             .orNull
-            ?: "0.6.2"
+            ?: "0.7.0"
     }
 
     signingConfigs {
@@ -67,6 +67,7 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+        isCoreLibraryDesugaringEnabled = true
     }
 
     packaging {
@@ -97,6 +98,8 @@ dependencies {
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("com.github.TeamNewPipe:NewPipeExtractor:v0.26.3")
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs_nio:2.1.5")
 
     implementation("com.frostwire:jlibtorrent:$jlibtorrentVersion")
     implementation("com.frostwire:jlibtorrent-android-arm:$jlibtorrentVersion")

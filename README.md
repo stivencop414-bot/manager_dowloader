@@ -1,28 +1,29 @@
 # Manager Downloader
 
-Aplicación Android nativa en Kotlin + Jetpack Compose para descargas HTTP/HTTPS y BitTorrent.
+Administrador de descargas Android nativo en Kotlin + Jetpack Compose.
 
-## v0.6.2
-Esta revisión está enfocada en estabilidad: detector multimedia selectivo para video/audio, navegador con menos procesos auxiliares, limitador de velocidad seguro y aplicación de ajustes sin iniciar servicios innecesarios.
+## v0.7.0
 
 ### Descargas
-- HTTP/HTTPS con reanudación y Range cuando el servidor lo permite.
-- Segmentación configurable y modo Turbo.
-- Cola secuencial o simultánea.
-- Magnet, `.torrent` web y `.torrent` local.
-- Pausar, continuar, cancelar, reintentar, priorizar y actualizar URL.
-- Abrir, compartir, mover y eliminar archivos HTTP completados.
+- HTTP/HTTPS con Range, pausa, reanudación y segmentación.
+- Cola secuencial o simultánea, Modo Turbo y limitador global.
+- Magnet, `.torrent` local y `.torrent` web.
+- Abrir, compartir, mover y eliminar archivos terminados.
 
 ### Navegador
 - DuckDuckGo, Google, Bing y Brave.
-- AdBlock activable/desactivable.
-- Detector de video/audio; las imágenes decorativas no se agregan a la lista de medios.
+- AdBlock configurable y allow-list por sitio.
+- Detector genérico limitado a video/audio directos.
+- Las páginas HTML y payloads de texto no se añaden accidentalmente como archivos `.txt`.
 
-### Almacenamiento
-- Selección de carpeta mediante Storage Access Framework.
-- Organización por Videos, Imagenes, Audio, Comprimidos, Programas, Documentos, Torrents y Otros.
+### YouTube
+- Reconoce `watch`, `youtu.be`, Shorts, Live, Embed y YouTube Music.
+- Puede recibir enlaces con el menú Compartir de Android.
+- Analiza metadatos y streams con NewPipe Extractor v0.26.3.
+- Permite descargar streams combinados video+audio disponibles y audio-only.
+- Las pistas 1080p/4K separadas se muestran pero todavía requieren una fase de muxing.
 
-### Rendimiento y estabilidad
-- Limitador global 0–100 MB/s con token bucket compartido.
-- Menor presión de memoria en descargas segmentadas.
-- Los sliders no reinician el servicio cuando no hay transferencias activas.
+### Seguridad y límites
+- No intenta eludir DRM, autenticación, contenido privado ni restricciones de acceso.
+- El usuario debe descargar únicamente contenido que tenga derecho o permiso para guardar.
+- El APK automático sigue siendo una build de prueba hasta configurar firma release permanente.

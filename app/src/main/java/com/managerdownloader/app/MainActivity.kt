@@ -12,18 +12,23 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.result.contract.ActivityResultContracts.OpenDocumentTree
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.lifecycle.lifecycleScope
 import com.managerdownloader.app.data.DownloadKind
 import com.managerdownloader.app.data.DownloadRepository
 import com.managerdownloader.app.data.StorageRepository
 import com.managerdownloader.app.download.DownloadService
 import com.managerdownloader.app.ui.ManagerDownloaderApp
+import com.managerdownloader.app.youtube.YouTubeUrlParser
 import java.io.File
 import java.util.UUID
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
+    private var incomingBrowserUrl by mutableStateOf<String?>(null)
     private val notificationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
@@ -96,7 +101,9 @@ class MainActivity : ComponentActivity() {
                 onMoveCompleted = { taskId ->
                     pendingMoveTaskId = taskId
                     moveFileLauncher.launch(null)
-                }
+                },
+                incomingBrowserUrl = incomingBrowserUrl,
+                onIncomingBrowserUrlConsumed = { incomingBrowserUrl = null }
             )
         }
     }
@@ -108,15 +115,33 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleIncomingIntent(intent: Intent?) {
-        if (intent?.action != Intent.ACTION_VIEW) return
-        val uri = intent.data ?: return
+        when (intent?.action) {
+            Intent.ACTION_SEND -> {
+                if (intent.type == "text/plain") {
+                    val text = intent.getStringExtra(Intent.EXTRA_TEXT)
+                    val youtube = YouTubeUrlParser.findInText(text)
+                    if (youtube != null) {
+                        incomingBrowserUrl = youtube.canonicalUrl ?: youtube.rawUrl
+                    } else {
+                        val sharedUrl = text?.trim()?.takeIf {
+                            it.startsWith("http://", true) || it.startsWith("https://", true)
+                        }
+                        if (sharedUrl != null) incomingBrowserUrl = sharedUrl
+                    }
+                }
+            }
 
-        when {
-            uri.scheme.equals("magnet", true) -> enqueueTorrent(uri.toString(), magnetName(uri))
-            intent.type.equals("application/x-bittorrent", true) ||
-                uri.toString().substringBefore('?').endsWith(".torrent", true) -> {
-                importTorrentUri(uri)?.let { (localUri, name) ->
-                    enqueueTorrent(localUri, name)
+            Intent.ACTION_VIEW -> {
+                val uri = intent.data ?: return
+                when {
+                    uri.scheme.equals("magnet", true) -> enqueueTorrent(uri.toString(), magnetName(uri))
+                    intent.type.equals("application/x-bittorrent", true) ||
+                        uri.toString().substringBefore('?').endsWith(".torrent", true) -> {
+                        importTorrentUri(uri)?.let { (localUri, name) ->
+                            enqueueTorrent(localUri, name)
+                        }
+                    }
+                    YouTubeUrlParser.parse(uri.toString()) != null -> incomingBrowserUrl = uri.toString()
                 }
             }
         }

@@ -272,6 +272,20 @@ fun SettingsScreen(
             }
         }
 
+        SettingsCard(title = "YouTube") {
+            Text("Analizador dedicado", fontWeight = FontWeight.SemiBold)
+            Text(
+                "Reconoce enlaces de YouTube/Shorts/Live y permite analizarlos desde el navegador o desde Compartir de Android. La página web nunca se agrega como .txt.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 12.sp
+            )
+            Text(
+                "Video+audio combinado y audio-only pueden descargarse. Las pistas de alta calidad separadas se muestran, pero requieren un muxer para generar un archivo final con audio.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 12.sp
+            )
+        }
+
         SettingsCard(title = "Adblock y privacidad") {
             ToggleRow(
                 title = "Bloquear publicidad",
