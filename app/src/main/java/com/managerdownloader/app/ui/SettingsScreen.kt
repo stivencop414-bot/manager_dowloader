@@ -1,7 +1,7 @@
 package com.managerdownloader.app.ui
 
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
+import android.webkit.CookieManager
+import android.webkit.WebStorage
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
@@ -12,7 +12,9 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilterChip
@@ -30,9 +32,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.managerdownloader.app.browser.ContentBlocker
+import com.managerdownloader.app.data.AdBlockMode
 import com.managerdownloader.app.data.QueueMode
+import com.managerdownloader.app.data.SearchEngine
 import com.managerdownloader.app.data.SettingsRepository
 import com.managerdownloader.app.data.StorageRepository
+import com.managerdownloader.app.data.ThemeMode
 
 @Composable
 fun SettingsScreen(
@@ -54,27 +59,29 @@ fun SettingsScreen(
             ),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        Text("AJUSTES", fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.8.sp,
-            color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Text("Rendimiento", fontSize = 31.sp, fontWeight = FontWeight.Bold)
         Text(
-            "Controla cuántos archivos y conexiones usa el motor. Más conexiones no siempre significan más velocidad.",
+            "AJUSTES",
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Bold,
+            letterSpacing = 1.8.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text("Manager Downloader", fontSize = 31.sp, fontWeight = FontWeight.Bold)
+        Text(
+            "Rendimiento, red, navegador, privacidad y apariencia.",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             fontSize = 13.sp
         )
 
         SettingsCard(title = "Almacenamiento y organización") {
-            Text(
-                "Carpeta de destino",
-                fontWeight = FontWeight.SemiBold
-            )
+            Text("Carpeta de destino", fontWeight = FontWeight.SemiBold)
             Text(
                 StorageRepository.selectedLabel(),
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 fontSize = 12.sp
             )
             Text(
-                "Los archivos terminados se ordenan automáticamente en Videos, Imágenes, Audio, Comprimidos, Programas, Documentos, Torrents y Otros.",
+                "Los archivos terminados se ordenan en Videos, Imágenes, Audio, Comprimidos, Programas, Documentos, Torrents y Otros.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 fontSize = 12.sp
             )
@@ -99,7 +106,7 @@ fun SettingsScreen(
                         SettingsRepository.setQueueMode(QueueMode.PARALLEL)
                         onTransferSettingsChanged()
                     },
-                    label = { Text("Todos / simultáneos") }
+                    label = { Text("Simultáneos") }
                 )
             }
 
@@ -116,40 +123,170 @@ fun SettingsScreen(
             }
         }
 
-        SettingsCard(title = "Aceleración HTTP") {
-            Text(
-                "Conexiones por archivo: ${settings.segmentsPerFile}",
-                fontWeight = FontWeight.SemiBold
+        SettingsCard(title = "Aceleración y ancho de banda") {
+            ToggleRow(
+                title = "Modo Turbo",
+                subtitle = "Usa segmentación más agresiva, buffers mayores y más conexiones en archivos grandes. Algunos servidores pueden rendir mejor con Turbo desactivado.",
+                checked = settings.turboMode,
+                onCheckedChange = {
+                    SettingsRepository.setTurboMode(it)
+                    onTransferSettingsChanged()
+                }
             )
+
+            Text("Conexiones máximas por archivo: ${settings.segmentsPerFile}", fontWeight = FontWeight.SemiBold)
             Text(
-                "El motor usa HTTP Range automáticamente cuando el servidor lo permite y conserva cada segmento para reanudarlo.",
+                "Se usan solo cuando el servidor acepta HTTP Range. En modo Turbo el motor puede llegar hasta 16 segmentos en archivos grandes.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 fontSize = 12.sp
             )
             Slider(
                 value = settings.segmentsPerFile.toFloat(),
                 onValueChange = { SettingsRepository.setSegmentsPerFile(it.toInt()) },
-                valueRange = 1f..12f,
-                steps = 10
+                onValueChangeFinished = onTransferSettingsChanged,
+                valueRange = 1f..16f,
+                steps = 14
+            )
+
+            Spacer(Modifier.height(8.dp))
+            Text("Reintentos por conexión: ${settings.segmentRetryCount}", fontWeight = FontWeight.SemiBold)
+            Text(
+                "Si una conexión se corta, el segmento intenta continuar desde los bytes ya guardados.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 12.sp
+            )
+            Slider(
+                value = settings.segmentRetryCount.toFloat(),
+                onValueChange = { SettingsRepository.setSegmentRetryCount(it.toInt()) },
+                onValueChangeFinished = onTransferSettingsChanged,
+                valueRange = 0f..5f,
+                steps = 4
+            )
+
+            Spacer(Modifier.height(8.dp))
+            Text(
+                if (settings.bandwidthLimitMbps == 0) "Límite de velocidad: sin límite"
+                else "Límite global: ${settings.bandwidthLimitMbps} MB/s",
+                fontWeight = FontWeight.SemiBold
+            )
+            Slider(
+                value = settings.bandwidthLimitMbps.toFloat(),
+                onValueChange = { SettingsRepository.setBandwidthLimitMbps((it / 5f).toInt() * 5) },
+                onValueChangeFinished = onTransferSettingsChanged,
+                valueRange = 0f..100f,
+                steps = 19
+            )
+            ToggleRow(
+                title = "Solo Wi‑Fi",
+                subtitle = "Evita iniciar nuevas descargas HTTP o torrent usando datos móviles.",
+                checked = settings.wifiOnly,
+                onCheckedChange = {
+                    SettingsRepository.setWifiOnly(it)
+                    onTransferSettingsChanged()
+                }
+            )
+
+            Text(
+                "Para máxima velocidad en un solo archivo, usa Uno por uno + Turbo. El rendimiento final también depende del servidor y de tu red.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 12.sp
             )
         }
 
-        SettingsCard(title = "Navegador y bloqueo") {
+        SettingsCard(title = "Navegador") {
+            Text("Motor de búsqueda", fontWeight = FontWeight.SemiBold)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(
+                    selected = settings.searchEngine == SearchEngine.DUCKDUCKGO,
+                    onClick = { SettingsRepository.setSearchEngine(SearchEngine.DUCKDUCKGO) },
+                    label = { Text("DuckDuckGo") }
+                )
+                FilterChip(
+                    selected = settings.searchEngine == SearchEngine.GOOGLE,
+                    onClick = { SettingsRepository.setSearchEngine(SearchEngine.GOOGLE) },
+                    label = { Text("Google") }
+                )
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(
+                    selected = settings.searchEngine == SearchEngine.BING,
+                    onClick = { SettingsRepository.setSearchEngine(SearchEngine.BING) },
+                    label = { Text("Bing") }
+                )
+                FilterChip(
+                    selected = settings.searchEngine == SearchEngine.BRAVE,
+                    onClick = { SettingsRepository.setSearchEngine(SearchEngine.BRAVE) },
+                    label = { Text("Brave") }
+                )
+            }
+
+            ToggleRow(
+                title = "Compatibilidad tipo Chrome",
+                subtitle = "Aplica el User-Agent compatible antes de la primera carga; ayuda con Google y sitios que rechazan el marcador WebView.",
+                checked = settings.chromeCompatUserAgent,
+                onCheckedChange = SettingsRepository::setChromeCompatUserAgent
+            )
+            ToggleRow(
+                title = "Cookies de terceros",
+                subtitle = "Desactivadas por defecto por privacidad. Actívalas si un inicio de sesión o sitio integrado no funciona.",
+                checked = settings.thirdPartyCookies,
+                onCheckedChange = SettingsRepository::setThirdPartyCookies
+            )
+            ToggleRow(
+                title = "Detector de medios",
+                subtitle = "Detecta enlaces HTTP/HTTPS de video, audio e imágenes visibles en la página y en el DOM.",
+                checked = settings.mediaSnifferEnabled,
+                onCheckedChange = SettingsRepository::setMediaSnifferEnabled
+            )
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = {
+                    CookieManager.getInstance().removeAllCookies(null)
+                    CookieManager.getInstance().flush()
+                }) { Text("Borrar cookies") }
+                OutlinedButton(onClick = { WebStorage.getInstance().deleteAllData() }) {
+                    Text("Borrar datos web")
+                }
+            }
+        }
+
+        SettingsCard(title = "Adblock y privacidad") {
             ToggleRow(
                 title = "Bloquear publicidad",
-                subtitle = "Intercepta peticiones de anuncios dentro del WebView.",
+                subtitle = "Interruptor principal. También se puede cambiar desde el navegador.",
                 checked = settings.adBlockEnabled,
                 onCheckedChange = SettingsRepository::setAdBlockEnabled
             )
             ToggleRow(
                 title = "Bloquear rastreadores",
-                subtitle = "Añade reglas de privacidad; desactívalo si una web deja de funcionar.",
+                subtitle = "Añade reglas de privacidad; se puede apagar sin desactivar todo el AdBlock.",
                 checked = settings.blockTrackers,
                 enabled = settings.adBlockEnabled,
                 onCheckedChange = SettingsRepository::setBlockTrackers
             )
+
+            Text("Nivel de bloqueo", fontWeight = FontWeight.SemiBold)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(
+                    selected = settings.adBlockMode == AdBlockMode.STANDARD,
+                    onClick = { SettingsRepository.setAdBlockMode(AdBlockMode.STANDARD) },
+                    enabled = settings.adBlockEnabled,
+                    label = { Text("Estándar") }
+                )
+                FilterChip(
+                    selected = settings.adBlockMode == AdBlockMode.STRICT,
+                    onClick = { SettingsRepository.setAdBlockMode(AdBlockMode.STRICT) },
+                    enabled = settings.adBlockEnabled,
+                    label = { Text("Estricto") }
+                )
+            }
             Text(
-                "${ContentBlocker.ruleCount()} dominios cargados",
+                "Estándar nunca bloquea el documento principal, peticiones POST ni recursos del mismo sitio. Es el recomendado para evitar páginas en blanco. Estricto bloquea más subrecursos y puede romper sitios.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 12.sp
+            )
+            Text(
+                "${ContentBlocker.ruleCount()} dominios · ${ContentBlocker.blockedCount()} peticiones bloqueadas en esta sesión",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 fontSize = 12.sp
             )
@@ -158,8 +295,28 @@ fun SettingsScreen(
             }
         }
 
+        SettingsCard(title = "Apariencia") {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(
+                    selected = settings.themeMode == ThemeMode.SYSTEM,
+                    onClick = { SettingsRepository.setThemeMode(ThemeMode.SYSTEM) },
+                    label = { Text("Sistema") }
+                )
+                FilterChip(
+                    selected = settings.themeMode == ThemeMode.LIGHT,
+                    onClick = { SettingsRepository.setThemeMode(ThemeMode.LIGHT) },
+                    label = { Text("Claro") }
+                )
+                FilterChip(
+                    selected = settings.themeMode == ThemeMode.DARK,
+                    onClick = { SettingsRepository.setThemeMode(ThemeMode.DARK) },
+                    label = { Text("Oscuro") }
+                )
+            }
+        }
+
         Text(
-            "Torrent: magnet y archivos .torrent usan libtorrent. Las descargas torrent se detienen al completar para no dejar la app sembrando indefinidamente.",
+            "Torrent: magnet, .torrent local y .torrent web usan libtorrent. Manager Downloader detiene la siembra al completar.",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             fontSize = 12.sp
         )

@@ -6,6 +6,7 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
+import com.managerdownloader.app.data.ThemeMode
 
 val Primary = Color(0xFF146BFF)
 val Success = Color(0xFF17A673)
@@ -40,9 +41,17 @@ private val DarkColors = darkColorScheme(
 )
 
 @Composable
-fun ManagerTheme(content: @Composable () -> Unit) {
+fun ManagerTheme(
+    themeMode: ThemeMode = ThemeMode.SYSTEM,
+    content: @Composable () -> Unit
+) {
+    val dark = when (themeMode) {
+        ThemeMode.SYSTEM -> isSystemInDarkTheme()
+        ThemeMode.LIGHT -> false
+        ThemeMode.DARK -> true
+    }
     MaterialTheme(
-        colorScheme = if (isSystemInDarkTheme()) DarkColors else LightColors,
+        colorScheme = if (dark) DarkColors else LightColors,
         content = content
     )
 }

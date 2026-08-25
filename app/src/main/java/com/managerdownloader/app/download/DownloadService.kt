@@ -7,6 +7,9 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Environment
 import android.os.IBinder
@@ -28,6 +31,7 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
 import java.io.RandomAccessFile
+import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
@@ -36,6 +40,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicLongArray
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.max
 import okhttp3.Call
 import okhttp3.ConnectionPool
 import okhttp3.Dispatcher
@@ -65,21 +70,64 @@ internal class TransferControl(val id: String) {
     }
 }
 
+private class SharedBandwidthLimiter(
+    private val rateProvider: () -> Long
+) {
+    private val lock = Any()
+    private var nextAvailableNanos = 0L
+
+    fun acquire(bytes: Int) {
+        val rate = rateProvider()
+        if (rate <= 0L || bytes <= 0) return
+
+        val waitNanos = synchronized(lock) {
+            val now = System.nanoTime()
+            val start = max(now, nextAvailableNanos)
+            val duration = ((bytes.toDouble() / rate.toDouble()) * 1_000_000_000.0).toLong()
+            nextAvailableNanos = start + duration
+            (start - now).coerceAtLeast(0L)
+        }
+
+        if (waitNanos > 0L) {
+            val millis = waitNanos / 1_000_000L
+            val nanos = (waitNanos % 1_000_000L).toInt()
+            Thread.sleep(millis, nanos)
+        }
+    }
+}
+
 class DownloadService : Service() {
     private val transferExecutor = Executors.newCachedThreadPool()
-    private val segmentExecutor = Executors.newFixedThreadPool(24)
+    private val segmentExecutor = Executors.newFixedThreadPool(32)
     private val schedulerLock = Any()
     private val active = ConcurrentHashMap<String, TransferControl>()
     private val shuttingDown = AtomicBoolean(false)
+    private val bandwidthLimiter = SharedBandwidthLimiter {
+        SettingsRepository.settings.value.bandwidthLimitBytesPerSecond
+    }
+    private lateinit var connectivityManager: ConnectivityManager
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            schedule()
+        }
+
+        override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+            handleNetworkPolicyChange()
+        }
+
+        override fun onLost(network: Network) {
+            handleNetworkPolicyChange()
+        }
+    }
 
     private val httpDispatcher = Dispatcher().apply {
         maxRequests = 64
-        maxRequestsPerHost = 16
+        maxRequestsPerHost = 32
     }
 
     private val client = OkHttpClient.Builder()
         .dispatcher(httpDispatcher)
-        .connectionPool(ConnectionPool(16, 5, java.util.concurrent.TimeUnit.MINUTES))
+        .connectionPool(ConnectionPool(32, 5, java.util.concurrent.TimeUnit.MINUTES))
         .followRedirects(true)
         .followSslRedirects(true)
         .retryOnConnectionFailure(true)
@@ -94,6 +142,8 @@ class DownloadService : Service() {
         super.onCreate()
         createNotificationChannel()
         torrentEngine = TorrentEngine(this, client, ::downloadsDirectory)
+        connectivityManager = getSystemService(ConnectivityManager::class.java)
+        runCatching { connectivityManager.registerDefaultNetworkCallback(networkCallback) }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -105,6 +155,8 @@ class DownloadService : Service() {
             ACTION_PAUSE -> intent.getStringExtra(EXTRA_ID)?.let(::pauseInternal)
             ACTION_RESUME -> intent.getStringExtra(EXTRA_ID)?.let(::resumeInternal)
             ACTION_CANCEL -> intent.getStringExtra(EXTRA_ID)?.let(::cancelInternal)
+            ACTION_PAUSE_ALL -> pauseAllInternal()
+            ACTION_RESUME_ALL -> resumeAllInternal()
             ACTION_PROCESS, null -> Unit
         }
 
@@ -130,6 +182,35 @@ class DownloadService : Service() {
         DownloadRepository.remove(id)
     }
 
+    private fun pauseAllInternal() {
+        DownloadRepository.downloads.value
+            .filter { it.status == DownloadStatus.ACTIVE || it.status == DownloadStatus.QUEUED }
+            .forEach { pauseInternal(it.id) }
+    }
+
+    private fun resumeAllInternal() {
+        DownloadRepository.downloads.value
+            .filter { it.status == DownloadStatus.PAUSED }
+            .forEach { resumeInternal(it.id) }
+    }
+
+    private fun handleNetworkPolicyChange() {
+        if (!SettingsRepository.settings.value.wifiOnly) {
+            schedule()
+            return
+        }
+        if (isWifiConnected()) {
+            schedule()
+            return
+        }
+        active.forEach { (id, control) ->
+            DownloadRepository.waitForWifi(id)
+            control.pause()
+            torrentEngine.pause(id)
+        }
+        ensureForeground("Esperando Wi-Fi…")
+    }
+
     /**
      * Starts as many queued items as allowed by the selected queue mode.
      * SEQUENTIAL = 1 active item. PARALLEL = user-selected 2..6 active items.
@@ -139,6 +220,13 @@ class DownloadService : Service() {
 
         synchronized(schedulerLock) {
             val settings = SettingsRepository.settings.value
+            if (settings.wifiOnly && !isWifiConnected()) {
+                DownloadRepository.queued(1000).forEach {
+                    DownloadRepository.updateMetadata(it.id, detail = "Esperando Wi-Fi")
+                }
+                ensureForeground("Esperando Wi-Fi…")
+                return
+            }
             val limit = settings.activeTransferLimit
             val slots = (limit - active.size).coerceAtLeast(0)
 
@@ -216,7 +304,7 @@ class DownloadService : Service() {
             )
         } else {
             prepareSingleLayout(task.id, probe.totalBytes, probe.validator)
-            downloadSingle(task.copy(filename = safeFilename), probe.validator, control)
+            downloadSingleWithRetries(task.copy(filename = safeFilename), probe.validator, control)
         }
     }
 
@@ -277,13 +365,25 @@ class DownloadService : Service() {
 
     private fun chooseSegmentCount(total: Long, requested: Int, rangeSupported: Boolean): Int {
         if (!rangeSupported || total <= 0L) return 1
-        val desired = requested.coerceIn(1, 12)
-        return when {
-            total < 8L * 1024L * 1024L -> 1
-            total < 32L * 1024L * 1024L -> desired.coerceAtMost(2)
-            total < 128L * 1024L * 1024L -> desired.coerceAtMost(4)
-            total < 512L * 1024L * 1024L -> desired.coerceAtMost(8)
-            else -> desired
+        val settings = SettingsRepository.settings.value
+        val desired = requested.coerceIn(1, 16)
+        return if (settings.turboMode) {
+            when {
+                total < 4L * 1024L * 1024L -> 1
+                total < 16L * 1024L * 1024L -> desired.coerceAtMost(2)
+                total < 64L * 1024L * 1024L -> desired.coerceAtMost(4)
+                total < 256L * 1024L * 1024L -> desired.coerceAtMost(8)
+                total < 1024L * 1024L * 1024L -> desired.coerceAtMost(12)
+                else -> desired
+            }
+        } else {
+            when {
+                total < 8L * 1024L * 1024L -> 1
+                total < 32L * 1024L * 1024L -> desired.coerceAtMost(2)
+                total < 128L * 1024L * 1024L -> desired.coerceAtMost(4)
+                total < 512L * 1024L * 1024L -> desired.coerceAtMost(8)
+                else -> desired.coerceAtMost(12)
+            }
         }
     }
 
@@ -322,19 +422,34 @@ class DownloadService : Service() {
         segments.forEachIndexed { index, segment ->
             segmentExecutor.execute {
                 try {
-                    downloadRange(
-                        task = task,
-                        index = index,
-                        segment = segment,
-                        progress = progress,
-                        totalBytes = totalBytes,
-                        segmentCount = segmentCount,
-                        validator = validator,
-                        control = control,
-                        progressLock = progressLock,
-                        lastUpdate = lastUpdate,
-                        lastBytes = lastBytes
-                    )
+                    val maxRetries = SettingsRepository.settings.value.segmentRetryCount
+                    var attempt = 0
+                    while (!control.stopped.get()) {
+                        try {
+                            downloadRange(
+                                task = task,
+                                index = index,
+                                segment = segment,
+                                progress = progress,
+                                totalBytes = totalBytes,
+                                segmentCount = segmentCount,
+                                validator = validator,
+                                control = control,
+                                progressLock = progressLock,
+                                lastUpdate = lastUpdate,
+                                lastBytes = lastBytes
+                            )
+                            break
+                        } catch (error: Throwable) {
+                            if (control.stopped.get() || attempt >= maxRetries) throw error
+                            attempt++
+                            DownloadRepository.updateMetadata(
+                                task.id,
+                                detail = "Reintentando conexión ${index + 1}/$segmentCount · intento $attempt/$maxRetries"
+                            )
+                            Thread.sleep((250L * attempt).coerceAtMost(1200L))
+                        }
+                    }
                 } catch (error: Throwable) {
                     if (!control.stopped.get()) {
                         firstError.compareAndSet(null, error)
@@ -352,6 +467,7 @@ class DownloadService : Service() {
 
         val finalFile = uniqueFinalFile(task.filename)
         mergeSegments(task.id, segmentCount, finalFile)
+        verifySha256IfRequested(task.id, finalFile)
         deleteSegmentFiles(task.id)
 
         val completedBytes = finalFile.length()
@@ -416,17 +532,19 @@ class DownloadService : Service() {
             RandomAccessFile(file, "rw").use { output ->
                 output.seek(existing)
                 body.byteStream().use { input ->
-                    val buffer = ByteArray(128 * 1024)
+                    val buffer = ByteArray(512 * 1024)
                     while (!control.stopped.get()) {
                         val read = input.read(buffer)
                         if (read == -1) break
+                        if (!ensureNetworkPolicy(task.id, control)) break
+                        bandwidthLimiter.acquire(read)
                         output.write(buffer, 0, read)
                         progress.addAndGet(index, read.toLong())
 
                         val now = System.currentTimeMillis()
-                        if (now - lastUpdate.get() >= 450L) {
+                        if (now - lastUpdate.get() >= 800L) {
                             synchronized(progressLock) {
-                                if (now - lastUpdate.get() >= 450L) {
+                                if (now - lastUpdate.get() >= 800L) {
                                     val downloaded = (0 until segmentCount).sumOf { progress.get(it) }
                                     val previousBytes = lastBytes.getAndSet(downloaded)
                                     val previousTime = lastUpdate.getAndSet(now)
@@ -450,6 +568,25 @@ class DownloadService : Service() {
 
         if (!control.stopped.get() && file.length() < segment.length) {
             throw IOException("Segmento ${index + 1} incompleto")
+        }
+    }
+
+    private fun downloadSingleWithRetries(task: DownloadTask, validator: String?, control: TransferControl) {
+        val maxRetries = SettingsRepository.settings.value.segmentRetryCount
+        var attempt = 0
+        while (!control.stopped.get()) {
+            try {
+                downloadSingle(task, validator, control)
+                return
+            } catch (error: Throwable) {
+                if (control.stopped.get() || attempt >= maxRetries) throw error
+                attempt++
+                DownloadRepository.updateMetadata(
+                    task.id,
+                    detail = "Reconectando descarga · intento $attempt/$maxRetries"
+                )
+                Thread.sleep((300L * attempt).coerceAtMost(1500L))
+            }
         }
     }
 
@@ -494,15 +631,17 @@ class DownloadService : Service() {
             RandomAccessFile(partial, "rw").use { output ->
                 output.seek(existing)
                 body.byteStream().use { input ->
-                    val buffer = ByteArray(256 * 1024)
+                    val buffer = ByteArray(1024 * 1024)
                     while (!control.stopped.get()) {
                         val read = input.read(buffer)
                         if (read == -1) break
+                        if (!ensureNetworkPolicy(task.id, control)) break
+                        bandwidthLimiter.acquire(read)
                         output.write(buffer, 0, read)
                         downloaded += read
 
                         val now = System.currentTimeMillis()
-                        if (now - lastTime >= 500L) {
+                        if (now - lastTime >= 800L) {
                             val speed = ((downloaded - lastBytes) * 1000L) / (now - lastTime).coerceAtLeast(1L)
                             DownloadRepository.updateProgress(task.id, downloaded, total, speed, "1 conexión")
                             updateAggregateNotification()
@@ -522,6 +661,7 @@ class DownloadService : Service() {
                 partial.delete()
             }
 
+            verifySha256IfRequested(task.id, finalFile, restoreTo = partial)
             val completedBytes = finalFile.length()
             val publishedPath = StorageRepository.publishFile(
                 finalFile,
@@ -582,6 +722,49 @@ class DownloadService : Service() {
                 }
             }
         }
+    }
+
+    private fun ensureNetworkPolicy(id: String, control: TransferControl): Boolean {
+        if (!SettingsRepository.settings.value.wifiOnly || isWifiConnected()) return true
+        DownloadRepository.waitForWifi(id)
+        control.pause()
+        return false
+    }
+
+    private fun isWifiConnected(): Boolean {
+        val network = connectivityManager.activeNetwork ?: return false
+        val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return false
+        return capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+    }
+
+    private fun verifySha256IfRequested(id: String, file: File, restoreTo: File? = null) {
+        val expected = DownloadRepository.find(id)?.expectedSha256 ?: return
+        val actual = sha256(file)
+        DownloadRepository.updateHash(id, actual)
+        if (!actual.equals(expected, ignoreCase = true)) {
+            if (restoreTo != null) {
+                runCatching {
+                    if (restoreTo.exists()) restoreTo.delete()
+                    file.renameTo(restoreTo)
+                }
+            } else {
+                runCatching { file.delete() }
+            }
+            throw IOException("SHA-256 no coincide. Esperado ${expected.take(12)}… · obtenido ${actual.take(12)}…")
+        }
+    }
+
+    private fun sha256(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        BufferedInputStream(FileInputStream(file), 256 * 1024).use { input ->
+            val buffer = ByteArray(1024 * 1024)
+            while (true) {
+                val read = input.read(buffer)
+                if (read == -1) break
+                digest.update(buffer, 0, read)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
     private fun downloadsDirectory(): File {
@@ -662,9 +845,27 @@ class DownloadService : Service() {
             .setOnlyAlertOnce(true)
             .setOngoing(true)
             .setContentIntent(contentIntent())
+            .addAction(
+                android.R.drawable.ic_media_pause,
+                "Pausar todo",
+                serviceActionIntent(ACTION_PAUSE_ALL, 11)
+            )
+            .addAction(
+                android.R.drawable.ic_media_play,
+                "Reanudar",
+                serviceActionIntent(ACTION_RESUME_ALL, 12)
+            )
         if (progress in 0..100) builder.setProgress(100, progress, false)
         return builder.build()
     }
+
+    private fun serviceActionIntent(action: String, requestCode: Int): PendingIntent =
+        PendingIntent.getService(
+            this,
+            requestCode,
+            Intent(this, DownloadService::class.java).setAction(action),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
 
     private fun contentIntent(): PendingIntent = PendingIntent.getActivity(
         this,
@@ -697,6 +898,7 @@ class DownloadService : Service() {
         shuttingDown.set(true)
         active.forEach { (_, control) -> control.pause() }
         torrentEngine.stopAsync()
+        runCatching { connectivityManager.unregisterNetworkCallback(networkCallback) }
         transferExecutor.shutdownNow()
         segmentExecutor.shutdownNow()
         DownloadRepository.flush()
@@ -719,12 +921,16 @@ class DownloadService : Service() {
         private const val ACTION_PAUSE = "manager.action.PAUSE"
         private const val ACTION_RESUME = "manager.action.RESUME"
         private const val ACTION_CANCEL = "manager.action.CANCEL"
+        private const val ACTION_PAUSE_ALL = "manager.action.PAUSE_ALL"
+        private const val ACTION_RESUME_ALL = "manager.action.RESUME_ALL"
         private const val EXTRA_ID = "download_id"
 
         fun process(context: Context) = send(context, ACTION_PROCESS)
         fun pause(context: Context, id: String) = send(context, ACTION_PAUSE, id)
         fun resume(context: Context, id: String) = send(context, ACTION_RESUME, id)
         fun cancel(context: Context, id: String) = send(context, ACTION_CANCEL, id)
+        fun pauseAll(context: Context) = send(context, ACTION_PAUSE_ALL)
+        fun resumeAll(context: Context) = send(context, ACTION_RESUME_ALL)
 
         private fun send(context: Context, action: String, id: String? = null) {
             val intent = Intent(context, DownloadService::class.java).setAction(action)

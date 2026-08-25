@@ -3,22 +3,27 @@ package com.managerdownloader.app.browser
 import android.content.Context
 import android.net.Uri
 import android.webkit.WebResourceResponse
+import com.managerdownloader.app.data.AdBlockMode
 import com.managerdownloader.app.data.SettingsRepository
 import java.io.ByteArrayInputStream
 import java.util.Locale
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 import okhttp3.OkHttpClient
 import okhttp3.Request
 
 /**
- * Lightweight network blocker for the embedded WebView.
+ * Request-level content blocker for the embedded WebView.
  *
- * It intentionally focuses on standards-based request blocking. It does not try to
- * spoof or bypass anti-adblock scripts. The user can turn it off if a site breaks.
+ * STANDARD mode is intentionally conservative: it never blocks the main document,
+ * non-GET requests or same-site resources. This prevents the common "blank page"
+ * failure mode of simplistic host blockers. STRICT mode blocks matching subresources
+ * regardless of first/third party, while still never replacing the main frame.
  */
 object ContentBlocker {
     private const val PREFS = "content_blocker"
     private const val KEY_UPDATED_AT = "updated_at"
+    private const val KEY_ALLOWED_SITES = "allowed_sites"
     private const val AD_CACHE = "easylist_hosts.txt"
     private const val HOSTS_CACHE = "stevenblack_hosts.txt"
     private const val PRIVACY_CACHE = "easyprivacy_hosts.txt"
@@ -37,6 +42,13 @@ object ContentBlocker {
     @Volatile
     private var trackerHosts: Set<String> = emptySet()
 
+    @Volatile
+    private var allowedSites: Set<String> = emptySet()
+
+    @Volatile
+    private var activePageHost: String? = null
+
+    private val blocked = AtomicLong(0L)
     private val executor = Executors.newSingleThreadExecutor()
     private val client = OkHttpClient.Builder()
         .followRedirects(true)
@@ -47,6 +59,11 @@ object ContentBlocker {
     fun initialize(context: Context) {
         if (initialized) return
         appContext = context.applicationContext
+        val prefs = appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        allowedSites = prefs.getStringSet(KEY_ALLOWED_SITES, emptySet())
+            ?.map { it.lowercase(Locale.US).trimEnd('.') }
+            ?.toSet()
+            .orEmpty()
         adHosts = DEFAULT_AD_HOSTS + readCache(AD_CACHE) + readCache(HOSTS_CACHE)
         trackerHosts = DEFAULT_TRACKER_HOSTS + readCache(PRIVACY_CACHE)
         initialized = true
@@ -81,29 +98,85 @@ object ContentBlocker {
         }
     }
 
-    fun shouldBlock(url: String?): Boolean {
+    fun setActivePage(url: String?) {
+        activePageHost = hostOf(url)
+    }
+
+    fun isCurrentSiteAllowed(url: String?): Boolean {
+        val host = hostOf(url) ?: return false
+        return matchesHost(host, allowedSites)
+    }
+
+    fun setCurrentSiteAllowed(url: String?, allowed: Boolean) {
+        if (!initialized) return
+        val host = hostOf(url) ?: return
+        val next = allowedSites.toMutableSet().apply {
+            if (allowed) add(host) else remove(host)
+        }.toSet()
+        allowedSites = next
+        appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putStringSet(KEY_ALLOWED_SITES, HashSet(next))
+            .apply()
+    }
+
+    fun shouldBlock(
+        url: String?,
+        isMainFrame: Boolean = false,
+        method: String? = "GET"
+    ): Boolean {
         if (!initialized || url.isNullOrBlank()) return false
         val settings = SettingsRepository.settings.value
         if (!settings.adBlockEnabled) return false
 
-        val host = runCatching { Uri.parse(url).host }
-            .getOrNull()
-            ?.lowercase(Locale.US)
-            ?.trimEnd('.')
-            ?: return false
+        // Never replace the main HTML document. Returning a synthetic response here can
+        // make the complete WebView appear blank.
+        if (isMainFrame) return false
 
+        // Do not interfere with form submissions / API writes.
+        if (!method.isNullOrBlank() && !method.equals("GET", ignoreCase = true)) return false
+
+        val topHost = activePageHost
+        if (topHost != null && matchesHost(topHost, allowedSites)) return false
+
+        val host = hostOf(url) ?: return false
         if (host == "localhost" || host.endsWith(".local")) return false
-        if (matchesHost(host, adHosts)) return true
-        return settings.blockTrackers && matchesHost(host, trackerHosts)
+        if (matchesHost(host, ESSENTIAL_COMPAT_HOSTS)) return false
+
+        val matched = matchesHost(host, adHosts) ||
+            (settings.blockTrackers && matchesHost(host, trackerHosts))
+        if (!matched) return false
+
+        if (settings.adBlockMode == AdBlockMode.STANDARD && topHost != null && sameSite(host, topHost)) {
+            return false
+        }
+
+        blocked.incrementAndGet()
+        return true
     }
 
     fun blockedResponse(): WebResourceResponse = WebResourceResponse(
         "text/plain",
         "utf-8",
+        204,
+        "No Content",
+        mapOf("Cache-Control" to "no-store"),
         ByteArrayInputStream(ByteArray(0))
     )
 
     fun ruleCount(): Int = adHosts.size + trackerHosts.size
+
+    fun blockedCount(): Long = blocked.get()
+
+    private fun hostOf(url: String?): String? = runCatching {
+        Uri.parse(url).host
+    }.getOrNull()
+        ?.lowercase(Locale.US)
+        ?.trimEnd('.')
+        ?.takeIf { it.isNotBlank() }
+
+    private fun sameSite(host: String, topHost: String): Boolean =
+        host == topHost || host.endsWith(".$topHost") || topHost.endsWith(".$host")
 
     private fun matchesHost(host: String, rules: Set<String>): Boolean {
         if (host in rules) return true
@@ -119,17 +192,16 @@ object ContentBlocker {
     private fun downloadRules(url: String): Set<String> = runCatching {
         val request = Request.Builder()
             .url(url)
-            .header("User-Agent", "ManagerDownloader/0.3")
+            .header("User-Agent", "ManagerDownloader/0.6")
             .get()
             .build()
         client.newCall(request).execute().use { response ->
             if (!response.isSuccessful) return@use emptySet<String>()
-            val body = response.body?.string().orEmpty()
-            parseHosts(body)
+            parseHosts(response.body?.string().orEmpty())
         }
     }.getOrDefault(emptySet<String>())
 
-    /** Extract the domain-only subset of EasyList/Adblock Plus rules. */
+    /** Extract the host-based subset of EasyList/EasyPrivacy/hosts sources. */
     private fun parseHosts(text: String): Set<String> = buildSet {
         text.lineSequence().forEach { raw ->
             val line = raw.trim()
@@ -138,10 +210,17 @@ object ContentBlocker {
             }
 
             if (line.startsWith("||")) {
-                // Conditional ABP rules need request-type/party semantics. Skip them
-                // instead of overblocking a site with a simplified host matcher.
-                if ('$' in line) return@forEach
-                val domain = line
+                val options = line.substringAfter('$', "")
+                if (
+                    options.contains("domain=", true) ||
+                    options.contains("redirect", true) ||
+                    options.contains("csp", true) ||
+                    options.contains("badfilter", true) ||
+                    options.contains("removeparam", true)
+                ) return@forEach
+
+                val rulePart = line.substringBefore('$')
+                val domain = rulePart
                     .removePrefix("||")
                     .substringBefore('^')
                     .substringBefore('/')
@@ -183,6 +262,12 @@ object ContentBlocker {
                 .writeText(hosts.sorted().joinToString("\n"))
         }
     }
+
+    private val ESSENTIAL_COMPAT_HOSTS = setOf(
+        "gstatic.com",
+        "googleusercontent.com",
+        "googleapis.com"
+    )
 
     private val DEFAULT_AD_HOSTS = setOf(
         "doubleclick.net",

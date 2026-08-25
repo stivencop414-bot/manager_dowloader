@@ -27,7 +27,9 @@ data class DownloadTask(
     val error: String? = null,
     val detail: String? = null,
     val cookie: String? = null,
-    val userAgent: String? = null
+    val userAgent: String? = null,
+    val expectedSha256: String? = null,
+    val actualSha256: String? = null
 ) {
     val progress: Float
         get() = if (totalBytes > 0) {

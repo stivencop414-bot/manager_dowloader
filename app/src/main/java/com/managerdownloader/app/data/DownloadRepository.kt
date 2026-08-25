@@ -48,7 +48,8 @@ object DownloadRepository {
         suggestedFilename: String? = null,
         cookie: String? = null,
         userAgent: String? = null,
-        kind: DownloadKind? = null
+        kind: DownloadKind? = null,
+        expectedSha256: String? = null
     ): DownloadTask = synchronized(lock) {
         ensureInitialized()
         val resolvedKind = kind ?: detectKind(url)
@@ -63,7 +64,8 @@ object DownloadRepository {
             kind = resolvedKind,
             order = _downloads.value.size,
             cookie = cookie,
-            userAgent = userAgent
+            userAgent = userAgent,
+            expectedSha256 = normalizeSha256(expectedSha256)
         )
         _downloads.value = (_downloads.value + task).sortedBy { it.order }
         persistLocked()
@@ -105,6 +107,16 @@ object DownloadRepository {
             status = DownloadStatus.QUEUED,
             speedBytesPerSecond = 0L,
             detail = "En cola",
+            error = null
+        )
+    }
+
+    fun waitForWifi(id: String) = update(id) { item ->
+        if (item.status == DownloadStatus.COMPLETED) item
+        else item.copy(
+            status = DownloadStatus.QUEUED,
+            speedBytesPerSecond = 0L,
+            detail = "Esperando Wi-Fi",
             error = null
         )
     }
@@ -167,6 +179,43 @@ object DownloadRepository {
             totalBytes = totalBytes?.takeIf { it >= 0 } ?: item.totalBytes,
             detail = detail ?: item.detail
         )
+    }
+
+    fun updateUrl(
+        id: String,
+        url: String,
+        cookie: String? = null,
+        userAgent: String? = null
+    ) = update(id) { item ->
+        item.copy(
+            url = url.trim(),
+            cookie = cookie ?: item.cookie,
+            userAgent = userAgent ?: item.userAgent,
+            status = if (item.status == DownloadStatus.COMPLETED) item.status else DownloadStatus.QUEUED,
+            speedBytesPerSecond = 0L,
+            error = null,
+            detail = "Enlace actualizado · reanudación conservada"
+        )
+    }
+
+    fun updateHash(id: String, actualSha256: String) = update(id) { item ->
+        item.copy(actualSha256 = normalizeSha256(actualSha256))
+    }
+
+    fun updateOutputPath(id: String, outputPath: String) = update(id) { item ->
+        item.copy(outputPath = outputPath, detail = "Archivo movido")
+    }
+
+    fun moveToTop(id: String) = synchronized(lock) {
+        ensureInitialized()
+        val list = _downloads.value.sortedBy { it.order }.toMutableList()
+        val index = list.indexOfFirst { it.id == id }
+        if (index <= 0) return
+        if (list[index].status == DownloadStatus.ACTIVE || list[index].status == DownloadStatus.COMPLETED) return
+        val moving = list.removeAt(index)
+        list.add(0, moving)
+        _downloads.value = list.mapIndexed { newIndex, item -> item.copy(order = newIndex) }
+        persistLocked()
     }
 
     fun flush() = synchronized(lock) {
@@ -235,6 +284,8 @@ object DownloadRepository {
                     put("detail", item.detail ?: JSONObject.NULL)
                     put("cookie", item.cookie ?: JSONObject.NULL)
                     put("userAgent", item.userAgent ?: JSONObject.NULL)
+                    put("expectedSha256", item.expectedSha256 ?: JSONObject.NULL)
+                    put("actualSha256", item.actualSha256 ?: JSONObject.NULL)
                 }
             )
         }
@@ -269,7 +320,9 @@ object DownloadRepository {
                             error = obj.optNullableString("error"),
                             detail = obj.optNullableString("detail"),
                             cookie = obj.optNullableString("cookie"),
-                            userAgent = obj.optNullableString("userAgent")
+                            userAgent = obj.optNullableString("userAgent"),
+                            expectedSha256 = normalizeSha256(obj.optNullableString("expectedSha256")),
+                            actualSha256 = normalizeSha256(obj.optNullableString("actualSha256"))
                         )
                     )
                 }
@@ -324,6 +377,11 @@ object DownloadRepository {
             .trim()
             .take(180)
         return clean.ifBlank { "descarga-${System.currentTimeMillis()}" }
+    }
+
+    private fun normalizeSha256(value: String?): String? {
+        val clean = value?.trim()?.lowercase()?.replace(" ", "").orEmpty()
+        return clean.takeIf { it.matches(Regex("^[0-9a-f]{64}$")) }
     }
 
     private fun ensureInitialized() {

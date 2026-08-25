@@ -9,6 +9,7 @@ import com.managerdownloader.app.data.DownloadRepository
 import com.managerdownloader.app.data.DownloadStatus
 import com.managerdownloader.app.data.DownloadTask
 import com.managerdownloader.app.data.StorageRepository
+import com.managerdownloader.app.data.SettingsRepository
 import java.io.File
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
@@ -36,6 +37,10 @@ internal class TorrentEngine(
             manager.maxPeers(500)
         }
         manager.maxActiveDownloads(maxActive.coerceAtLeast(1))
+        val limit = SettingsRepository.settings.value.bandwidthLimitBytesPerSecond
+            .coerceAtMost(Int.MAX_VALUE.toLong())
+            .toInt()
+        manager.downloadRateLimit(limit)
     }
 
     fun download(task: DownloadTask, control: TransferControl, maxActive: Int) {
@@ -70,6 +75,11 @@ internal class TorrentEngine(
 
         try {
             while (!control.stopped.get()) {
+                val desiredLimit = SettingsRepository.settings.value.bandwidthLimitBytesPerSecond
+                    .coerceAtMost(Int.MAX_VALUE.toLong())
+                    .toInt()
+                if (manager.downloadRateLimit() != desiredLimit) manager.downloadRateLimit(desiredLimit)
+
                 val current = DownloadRepository.find(task.id) ?: return
                 if (current.status == DownloadStatus.PAUSED) {
                     torrentHandle.pause()

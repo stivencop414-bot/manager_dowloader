@@ -6,11 +6,13 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.result.contract.ActivityResultContracts.OpenDocumentTree
+import androidx.lifecycle.lifecycleScope
 import com.managerdownloader.app.data.DownloadKind
 import com.managerdownloader.app.data.DownloadRepository
 import com.managerdownloader.app.data.StorageRepository
@@ -18,6 +20,8 @@ import com.managerdownloader.app.download.DownloadService
 import com.managerdownloader.app.ui.ManagerDownloaderApp
 import java.io.File
 import java.util.UUID
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     private val notificationPermissionLauncher =
@@ -27,6 +31,34 @@ class MainActivity : ComponentActivity() {
         registerForActivityResult(OpenDocumentTree()) { uri ->
             if (uri != null) StorageRepository.setTreeUri(this, uri)
             StorageRepository.markPrompted()
+        }
+
+    private var pendingMoveTaskId: String? = null
+
+    private val moveFileLauncher =
+        registerForActivityResult(OpenDocumentTree()) { uri ->
+            val taskId = pendingMoveTaskId
+            pendingMoveTaskId = null
+            if (uri == null || taskId == null) return@registerForActivityResult
+            val task = DownloadRepository.find(taskId) ?: return@registerForActivityResult
+            lifecycleScope.launch(Dispatchers.IO) {
+                runCatching { StorageRepository.moveCompletedFile(this@MainActivity, task, uri) }
+                    .onSuccess { newPath ->
+                        DownloadRepository.updateOutputPath(taskId, newPath)
+                        launch(Dispatchers.Main) {
+                            Toast.makeText(this@MainActivity, "Archivo movido", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                    .onFailure { error ->
+                        launch(Dispatchers.Main) {
+                            Toast.makeText(
+                                this@MainActivity,
+                                error.message ?: "No se pudo mover el archivo",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
+                    }
+            }
         }
 
     private val torrentFileLauncher =
@@ -60,6 +92,10 @@ class MainActivity : ComponentActivity() {
                         "application/x-bittorrent",
                         "application/octet-stream"
                     ))
+                },
+                onMoveCompleted = { taskId ->
+                    pendingMoveTaskId = taskId
+                    moveFileLauncher.launch(null)
                 }
             )
         }

@@ -22,14 +22,17 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import com.managerdownloader.app.data.DownloadRepository
 import com.managerdownloader.app.data.StorageRepository
+import com.managerdownloader.app.data.SettingsRepository
 import com.managerdownloader.app.download.DownloadService
 
 @Composable
 fun ManagerDownloaderApp(
     onSelectDownloadFolder: () -> Unit,
-    onOpenTorrentFile: () -> Unit
+    onOpenTorrentFile: () -> Unit,
+    onMoveCompleted: (String) -> Unit
 ) {
-    ManagerTheme {
+    val settings by SettingsRepository.settings.collectAsState()
+    ManagerTheme(settings.themeMode) {
         var tab by remember { mutableIntStateOf(0) }
         val context = LocalContext.current
         val selectedTree by StorageRepository.treeUri.collectAsState()
@@ -62,10 +65,11 @@ fun ManagerDownloaderApp(
             when (tab) {
                 0 -> DownloadsScreen(
                     contentPadding = padding,
-                    onAdd = { url, name, cookie, userAgent ->
-                        enqueue(context, url, name, cookie, userAgent)
+                    onAdd = { url, name, cookie, userAgent, expectedSha256 ->
+                        enqueue(context, url, name, cookie, userAgent, expectedSha256)
                     },
-                    onOpenTorrentFile = onOpenTorrentFile
+                    onOpenTorrentFile = onOpenTorrentFile,
+                    onMoveCompleted = onMoveCompleted
                 )
 
                 1 -> BrowserScreen(
@@ -117,13 +121,15 @@ fun enqueue(
     url: String,
     filename: String? = null,
     cookie: String? = null,
-    userAgent: String? = null
+    userAgent: String? = null,
+    expectedSha256: String? = null
 ) {
     DownloadRepository.add(
         url = url,
         suggestedFilename = filename,
         cookie = cookie,
-        userAgent = userAgent
+        userAgent = userAgent,
+        expectedSha256 = expectedSha256
     )
     DownloadService.process(context)
 }

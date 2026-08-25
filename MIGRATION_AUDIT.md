@@ -1,19 +1,13 @@
-# v0.4 implementation audit
+# v0.6 audit
 
-## Storage
-Uses SAF instead of broad storage permissions. Final files are categorized and published to the selected persistent tree URI. Partial/random-access data remains app-specific so resume and segmented HTTP remain reliable.
+Esta versión parte del motor v0.5.2 y se concentra en cuatro problemas observados durante pruebas reales: búsqueda de Google en WebView, páginas en blanco con AdBlock, falta de acciones sobre archivos terminados y rendimiento HTTP.
 
-## HTTP
-OkHttp dispatcher: 64 max requests, 16 per host; connection pool 16; segmented pool 24 workers; user-configurable 1–12 ranges with adaptive caps based on file size. Resume still validates range state with ETag/Last-Modified.
+## Decisiones
+- El User-Agent de compatibilidad se instala antes de la primera navegación.
+- El AdBlock Estándar no intercepta el documento principal, POST ni recursos same-site.
+- Se conserva un modo Estricto como opción explícita.
+- Se añaden acciones de archivo usando content URI/FileProvider y SAF.
+- El motor HTTP elimina contención en el limitador ilimitado, usa buffers mayores, segmentación hasta 16 conexiones y reintentos resumibles.
 
-## Torrent
-Magnet, remote `.torrent`, Android VIEW intents and an in-app local `.torrent` picker are supported. libtorrent still downloads to app-specific filesystem storage because SAF URIs are not normal filesystem paths; finished torrent trees are copied/published to the selected destination.
-
-## Browser
-Request-level content blocking remains in place. Direct media extensions encountered by WebView are surfaced to the user as detected media. DRM bypass and blob interception are intentionally not implemented.
-
-## Signing
-Build configuration can consume a permanent release keystore via environment variables. `release-signed.yml` is provided separately and expects GitHub Secrets. A consistent release signature is required for normal Android upgrades, but sideloaded apps may still be scanned/warned by Play Protect.
-
-## Validation
-Static source checks were performed here. GitHub Actions remains the authoritative Android compilation test.
+## Validación
+El workflow de upgrade compila `assembleDebug` antes de hacer commit a `main`. Si la compilación falla, la fuente vigente en `main` no se reemplaza.

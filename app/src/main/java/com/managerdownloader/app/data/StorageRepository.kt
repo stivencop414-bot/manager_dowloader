@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.webkit.MimeTypeMap
+import androidx.core.content.FileProvider
 import androidx.documentfile.provider.DocumentFile
 import java.io.File
 import java.io.FileInputStream
@@ -147,6 +148,94 @@ object StorageRepository {
         }
         return target.absolutePath
     }
+
+    fun openCompleted(context: Context, task: DownloadTask): Boolean {
+        val uri = shareableUri(context, task) ?: return false
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, mimeType(task.filename))
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        return runCatching {
+            context.startActivity(intent)
+            true
+        }.getOrDefault(false)
+    }
+
+    fun shareCompleted(context: Context, task: DownloadTask): Boolean {
+        val uri = shareableUri(context, task) ?: return false
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = mimeType(task.filename)
+            putExtra(Intent.EXTRA_STREAM, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        return runCatching {
+            context.startActivity(Intent.createChooser(intent, "Compartir ${task.filename}").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            true
+        }.getOrDefault(false)
+    }
+
+    /** Moves a completed HTTP file to a user-selected SAF directory. */
+    fun moveCompletedFile(context: Context, task: DownloadTask, destinationTree: Uri): String {
+        require(task.status == DownloadStatus.COMPLETED) { "La descarga aún no ha terminado" }
+        require(task.kind == DownloadKind.HTTP) { "Mover carpetas torrent se añadirá en una fase posterior" }
+        val sourcePath = task.outputPath ?: throw IOException("No se encontró el archivo terminado")
+        val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        runCatching { context.contentResolver.takePersistableUriPermission(destinationTree, flags) }
+
+        val root = DocumentFile.fromTreeUri(context, destinationTree)
+            ?: throw IOException("No se pudo abrir la carpeta elegida")
+        if (!root.canWrite()) throw IOException("La carpeta elegida no permite escritura")
+        val target = createUniqueFile(root, task.filename)
+
+        openSourceInputStream(context, sourcePath).use { input ->
+            context.contentResolver.openOutputStream(target.uri, "w")?.use { output ->
+                input.copyTo(output, 1024 * 1024)
+            } ?: throw IOException("No se pudo crear el archivo de destino")
+        }
+
+        deleteSource(context, sourcePath)
+        return target.uri.toString()
+    }
+
+    fun deleteCompleted(context: Context, task: DownloadTask): Boolean {
+        val path = task.outputPath ?: return false
+        return deleteSource(context, path)
+    }
+
+    private fun shareableUri(context: Context, task: DownloadTask): Uri? {
+        val value = task.outputPath?.takeIf { it.isNotBlank() } ?: return null
+        return when {
+            value.startsWith("content://", true) -> Uri.parse(value)
+            value.startsWith("file://", true) -> {
+                val file = File(Uri.parse(value).path ?: return null)
+                FileProvider.getUriForFile(context, "${context.packageName}.files", file)
+            }
+            else -> {
+                val file = File(value)
+                if (!file.exists() || file.isDirectory) return null
+                FileProvider.getUriForFile(context, "${context.packageName}.files", file)
+            }
+        }
+    }
+
+    private fun openSourceInputStream(context: Context, value: String): java.io.InputStream {
+        return if (value.startsWith("content://", true)) {
+            context.contentResolver.openInputStream(Uri.parse(value))
+                ?: throw IOException("No se pudo leer el archivo original")
+        } else {
+            val path = if (value.startsWith("file://", true)) Uri.parse(value).path else value
+            FileInputStream(File(path ?: throw IOException("Ruta inválida")))
+        }
+    }
+
+    private fun deleteSource(context: Context, value: String): Boolean = runCatching {
+        if (value.startsWith("content://", true)) {
+            DocumentFile.fromSingleUri(context, Uri.parse(value))?.delete() == true
+        } else {
+            val path = if (value.startsWith("file://", true)) Uri.parse(value).path else value
+            File(path ?: return@runCatching false).deleteRecursively()
+        }
+    }.getOrDefault(false)
 
     private fun copyDirectoryToTree(source: File, destination: DocumentFile) {
         source.listFiles()?.forEach { child ->
