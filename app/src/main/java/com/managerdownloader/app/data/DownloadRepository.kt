@@ -78,7 +78,11 @@ object DownloadRepository {
         kind: DownloadKind? = null,
         expectedSha256: String? = null,
         originalSourceUrl: String? = null,
-        sourceFormatId: String? = null
+        sourceFormatId: String? = null,
+        secondaryUrl: String? = null,
+        secondarySourceFormatId: String? = null,
+        muxContainer: String? = null,
+        sourceProfile: String? = null
     ): DownloadTask {
         val task = synchronized(lock) {
             ensureInitialized()
@@ -98,7 +102,11 @@ object DownloadRepository {
                 referer = referer?.takeIf { it.isNotBlank() },
                 expectedSha256 = normalizeSha256(expectedSha256),
                 originalSourceUrl = originalSourceUrl?.takeIf { it.isNotBlank() },
-                sourceFormatId = sourceFormatId?.takeIf { it.isNotBlank() }
+                sourceFormatId = sourceFormatId?.takeIf { it.isNotBlank() },
+                secondaryUrl = secondaryUrl?.takeIf { it.isNotBlank() },
+                secondarySourceFormatId = secondarySourceFormatId?.takeIf { it.isNotBlank() },
+                muxContainer = muxContainer?.lowercase()?.takeIf { it == "mp4" || it == "webm" },
+                sourceProfile = sourceProfile?.takeIf { it.isNotBlank() }
             ).also { newTask ->
                 _downloads.value = (_downloads.value + newTask).sortedBy { it.order }
             }
@@ -228,6 +236,27 @@ object DownloadRepository {
         )
     }
 
+    fun updateMuxUrls(
+        id: String,
+        videoUrl: String,
+        audioUrl: String,
+        videoFormatId: String?,
+        audioFormatId: String?,
+        container: String?,
+        filename: String? = null
+    ) = update(id) { item ->
+        item.copy(
+            url = videoUrl.trim(),
+            secondaryUrl = audioUrl.trim(),
+            sourceFormatId = videoFormatId ?: item.sourceFormatId,
+            secondarySourceFormatId = audioFormatId ?: item.secondarySourceFormatId,
+            muxContainer = container ?: item.muxContainer,
+            filename = filename?.takeIf { it.isNotBlank() }?.let(::sanitizeFilename) ?: item.filename,
+            error = null,
+            detail = "Enlaces HD renovados"
+        )
+    }
+
     fun updateHash(id: String, actualSha256: String) = update(id) { item ->
         item.copy(actualSha256 = normalizeSha256(actualSha256))
     }
@@ -347,6 +376,10 @@ object DownloadRepository {
                 put("actualSha256", item.actualSha256 ?: JSONObject.NULL)
                 put("originalSourceUrl", item.originalSourceUrl ?: JSONObject.NULL)
                 put("sourceFormatId", item.sourceFormatId ?: JSONObject.NULL)
+                put("secondaryUrl", item.secondaryUrl ?: JSONObject.NULL)
+                put("secondarySourceFormatId", item.secondarySourceFormatId ?: JSONObject.NULL)
+                put("muxContainer", item.muxContainer ?: JSONObject.NULL)
+                put("sourceProfile", item.sourceProfile ?: JSONObject.NULL)
             })
         }
 
@@ -396,7 +429,11 @@ object DownloadRepository {
                             expectedSha256 = normalizeSha256(obj.optNullableString("expectedSha256")),
                             actualSha256 = normalizeSha256(obj.optNullableString("actualSha256")),
                             originalSourceUrl = obj.optNullableString("originalSourceUrl"),
-                            sourceFormatId = obj.optNullableString("sourceFormatId")
+                            sourceFormatId = obj.optNullableString("sourceFormatId"),
+                            secondaryUrl = obj.optNullableString("secondaryUrl"),
+                            secondarySourceFormatId = obj.optNullableString("secondarySourceFormatId"),
+                            muxContainer = obj.optNullableString("muxContainer"),
+                            sourceProfile = obj.optNullableString("sourceProfile")
                         )
                     )
                 }

@@ -15,6 +15,7 @@ import androidx.activity.result.contract.ActivityResultContracts.OpenDocumentTre
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import com.managerdownloader.app.clipboard.ClipboardMonitor
 import com.managerdownloader.app.data.DownloadKind
 import com.managerdownloader.app.data.DownloadRepository
 import com.managerdownloader.app.data.StorageRepository
@@ -31,6 +32,8 @@ import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
     private var incomingBrowserUrl by mutableStateOf<String?>(null)
+    private var clipboardCandidate by mutableStateOf<String?>(null)
+    private lateinit var clipboardMonitor: ClipboardMonitor
     private val notificationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
@@ -77,7 +80,9 @@ class MainActivity : ComponentActivity() {
                         Intent.FLAG_GRANT_READ_URI_PERMISSION
                     )
                 }
-                enqueueTorrent(uri.toString(), queryDisplayName(uri))
+                importTorrentUri(uri)?.let { (localUri, name) ->
+                    enqueueTorrent(localUri, name)
+                }
             }
         }
 
@@ -89,6 +94,7 @@ class MainActivity : ComponentActivity() {
             notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
 
+        clipboardMonitor = ClipboardMonitor(this) { candidate -> clipboardCandidate = candidate }
         handleIncomingIntent(intent)
 
         setContent {
@@ -105,9 +111,28 @@ class MainActivity : ComponentActivity() {
                     moveFileLauncher.launch(null)
                 },
                 incomingBrowserUrl = incomingBrowserUrl,
-                onIncomingBrowserUrlConsumed = { incomingBrowserUrl = null }
+                onIncomingBrowserUrlConsumed = { incomingBrowserUrl = null },
+                clipboardCandidate = clipboardCandidate,
+                onClipboardAccept = { value ->
+                    clipboardCandidate = null
+                    incomingBrowserUrl = value
+                },
+                onClipboardDismiss = { value ->
+                    clipboardMonitor.dismiss(value)
+                    clipboardCandidate = null
+                }
             )
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (::clipboardMonitor.isInitialized) clipboardMonitor.checkClipboard()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus && ::clipboardMonitor.isInitialized) clipboardMonitor.checkClipboard()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -144,6 +169,8 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                     YouTubeUrlParser.parse(uri.toString()) != null -> incomingBrowserUrl = uri.toString()
+                    uri.scheme.equals("http", true) || uri.scheme.equals("https", true) ->
+                        incomingBrowserUrl = uri.toString()
                 }
             }
         }

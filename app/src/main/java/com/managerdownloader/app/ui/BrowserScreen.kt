@@ -85,11 +85,16 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import com.managerdownloader.app.browser.ContentBlocker
 import com.managerdownloader.app.browser.MediaSnifferFilter
+import com.managerdownloader.app.data.DownloadKind
 import com.managerdownloader.app.data.SearchEngine
 import com.managerdownloader.app.data.SettingsRepository
+import com.managerdownloader.app.hls.HlsManifestClient
+import com.managerdownloader.app.hls.HlsVariantStream
 import com.managerdownloader.app.youtube.YouTubeExtractorClient
 import com.managerdownloader.app.youtube.YouTubeFormatKind
 import com.managerdownloader.app.youtube.YouTubeLink
+import com.managerdownloader.app.youtube.YouTubePlaylistDetails
+import com.managerdownloader.app.youtube.YouTubePlaylistExtractor
 import com.managerdownloader.app.youtube.YouTubeUrlParser
 import com.managerdownloader.app.youtube.YouTubeVideoDetails
 import java.util.concurrent.atomic.AtomicBoolean
@@ -105,7 +110,12 @@ data class BrowserDownloadRequest(
     val userAgent: String?,
     val referer: String?,
     val originalSourceUrl: String? = null,
-    val sourceFormatId: String? = null
+    val sourceFormatId: String? = null,
+    val kind: DownloadKind? = null,
+    val secondaryUrl: String? = null,
+    val secondarySourceFormatId: String? = null,
+    val muxContainer: String? = null,
+    val sourceProfile: String? = null
 )
 
 private enum class DetectedMediaKind(val label: String) {
@@ -170,6 +180,12 @@ fun BrowserScreen(
     var showMediaDetected by remember { mutableStateOf(false) }
     var youtubeLink by remember { mutableStateOf<YouTubeLink?>(null) }
     var youtubeDetails by remember { mutableStateOf<YouTubeVideoDetails?>(null) }
+    var youtubePlaylistDetails by remember { mutableStateOf<YouTubePlaylistDetails?>(null) }
+    val selectedPlaylistUrls = remember { mutableStateListOf<String>() }
+    var streamVariants by remember { mutableStateOf<List<HlsVariantStream>>(emptyList()) }
+    var streamAnalyzedUrl by remember { mutableStateOf<String?>(null) }
+    var streamLoading by remember { mutableStateOf(false) }
+    var streamError by remember { mutableStateOf<String?>(null) }
     var youtubeError by remember { mutableStateOf<String?>(null) }
     var youtubeLoading by remember { mutableStateOf(false) }
     var showYouTubeDialog by remember { mutableStateOf(false) }
@@ -198,22 +214,41 @@ fun BrowserScreen(
     }
 
     fun analyzeYouTube(link: YouTubeLink) {
-        if (!link.isVideo) {
-            youtubeError = "Se detectó una playlist, pero esta versión analiza videos individuales."
-            showYouTubeDialog = true
-            return
-        }
         youtubeLoading = true
         youtubeError = null
         youtubeDetails = null
+        youtubePlaylistDetails = null
+        selectedPlaylistUrls.clear()
         showYouTubeDialog = true
         scope.launch {
-            val result = YouTubeExtractorClient.analyze(link.canonicalUrl ?: link.rawUrl)
-            youtubeLoading = false
-            result.onSuccess { youtubeDetails = it }
-                .onFailure { error ->
-                    youtubeError = error.message ?: error.javaClass.simpleName
-                }
+            if (link.isVideo) {
+                val result = YouTubeExtractorClient.analyze(link.canonicalUrl ?: link.rawUrl)
+                youtubeLoading = false
+                result.onSuccess { youtubeDetails = it }
+                    .onFailure { error -> youtubeError = error.message ?: error.javaClass.simpleName }
+            } else if (link.playlistId != null) {
+                val result = YouTubePlaylistExtractor.analyze(link.rawUrl)
+                youtubeLoading = false
+                result.onSuccess { youtubePlaylistDetails = it }
+                    .onFailure { error -> youtubeError = error.message ?: error.javaClass.simpleName }
+            } else {
+                youtubeLoading = false
+                youtubeError = "El enlace de YouTube no contiene un video o playlist compatible."
+            }
+        }
+    }
+
+    fun analyzeStream(item: DetectedDownload) {
+        if (item.kind != DetectedMediaKind.STREAM || !item.url.contains(".m3u8", true)) return
+        streamLoading = true
+        streamError = null
+        streamVariants = emptyList()
+        streamAnalyzedUrl = item.url
+        scope.launch {
+            val result = HlsManifestClient.analyze(item.url, item.cookie, item.userAgent, item.referer)
+            streamLoading = false
+            result.onSuccess { streamVariants = it }
+                .onFailure { error -> streamError = error.message ?: error.javaClass.simpleName }
         }
     }
 
@@ -221,6 +256,8 @@ fun BrowserScreen(
         youtubeLink = YouTubeUrlParser.parse(url)
         if (youtubeLink == null) {
             youtubeDetails = null
+            youtubePlaylistDetails = null
+            selectedPlaylistUrls.clear()
             youtubeError = null
             showYouTubeDialog = false
         }
@@ -750,7 +787,10 @@ fun BrowserScreen(
 
             if (mediaDetected.isNotEmpty()) {
                 FloatingActionButton(
-                    onClick = { showMediaDetected = true },
+                    onClick = {
+                        triggerActiveQualityRescan(webView)
+                        showMediaDetected = true
+                    },
                     modifier = Modifier
                         .align(Alignment.BottomEnd)
                         .padding(16.dp)
@@ -863,15 +903,48 @@ fun BrowserScreen(
                             }
                         }
 
-                        if (details.videoOnly.isNotEmpty()) {
+                        if (details.muxedHighQuality.isNotEmpty()) {
                             HorizontalDivider()
-                            Text("Calidad alta separada", style = MaterialTheme.typography.titleSmall)
+                            Text("Alta calidad fusionada", style = MaterialTheme.typography.titleSmall)
                             Text(
-                                "Se detectaron ${details.videoOnly.size} pistas de video sin audio. No se descargan como video final todavía porque requieren fusionar una pista de audio compatible.",
+                                "Descarga video y audio por separado y los fusiona localmente con MediaMuxer, sin recodificar.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
-                            details.videoOnly.take(4).forEach { Text("• ${it.label}", style = MaterialTheme.typography.bodySmall) }
+                            details.muxedHighQuality.take(8).forEach { option ->
+                                OutlinedButton(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    onClick = {
+                                        val cookie = CookieManager.getInstance().getCookie(details.sourceUrl)
+                                        onAddBatch(
+                                            listOf(
+                                                BrowserDownloadRequest(
+                                                    url = option.videoUrl,
+                                                    filename = option.filename,
+                                                    cookie = cookie,
+                                                    userAgent = runCatching { webView?.settings?.userAgentString }.getOrNull(),
+                                                    referer = details.sourceUrl,
+                                                    originalSourceUrl = details.sourceUrl,
+                                                    sourceFormatId = option.videoFormatId,
+                                                    kind = DownloadKind.YOUTUBE_MUXED,
+                                                    secondaryUrl = option.audioUrl,
+                                                    secondarySourceFormatId = option.audioFormatId,
+                                                    muxContainer = option.container
+                                                )
+                                            )
+                                        )
+                                        showYouTubeDialog = false
+                                    }
+                                ) { Text("Descargar ${option.label}") }
+                            }
+                        } else if (details.videoOnly.isNotEmpty()) {
+                            HorizontalDivider()
+                            Text("Calidad alta separada", style = MaterialTheme.typography.titleSmall)
+                            Text(
+                                "Hay pistas separadas, pero ninguna pareja es compatible con el muxer nativo del dispositivo.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
                         }
 
                         Text(
@@ -880,10 +953,74 @@ fun BrowserScreen(
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
+
+                    youtubePlaylistDetails?.let { playlist ->
+                        Text(playlist.title, style = MaterialTheme.typography.titleMedium)
+                        if (playlist.author.isNotBlank()) Text(playlist.author, style = MaterialTheme.typography.bodySmall)
+                        Text(
+                            "${playlist.items.size} videos${if (playlist.truncated) " · límite de 200 por análisis" else ""}. Los enlaces directos se resuelven justo cuando cada video obtiene turno para reducir 403/429.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            val allSelected = playlist.items.isNotEmpty() && playlist.items.all { it.canonicalUrl in selectedPlaylistUrls }
+                            Checkbox(
+                                checked = allSelected,
+                                onCheckedChange = { checked ->
+                                    selectedPlaylistUrls.clear()
+                                    if (checked) selectedPlaylistUrls.addAll(playlist.items.map { it.canonicalUrl })
+                                }
+                            )
+                            Text(if (allSelected) "Deseleccionar todo" else "Seleccionar todo")
+                        }
+                        Column(
+                            modifier = Modifier.height(280.dp).verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            playlist.items.forEach { item ->
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Checkbox(
+                                        checked = item.canonicalUrl in selectedPlaylistUrls,
+                                        onCheckedChange = { checked ->
+                                            if (checked && item.canonicalUrl !in selectedPlaylistUrls) selectedPlaylistUrls.add(item.canonicalUrl)
+                                            if (!checked) selectedPlaylistUrls.remove(item.canonicalUrl)
+                                        }
+                                    )
+                                    Column(Modifier.weight(1f)) {
+                                        Text("${item.position}. ${item.title}", maxLines = 2)
+                                        if (item.uploader.isNotBlank()) Text(item.uploader, style = MaterialTheme.typography.bodySmall)
+                                    }
+                                }
+                            }
+                        }
+                        Button(
+                            modifier = Modifier.fillMaxWidth(),
+                            enabled = selectedPlaylistUrls.isNotEmpty(),
+                            onClick = {
+                                val selected = selectedPlaylistUrls.toSet()
+                                val userAgent = runCatching { webView?.settings?.userAgentString }.getOrNull()
+                                val requests = playlist.items.filter { it.canonicalUrl in selected }.map { item ->
+                                    BrowserDownloadRequest(
+                                        url = item.canonicalUrl,
+                                        filename = "${item.title}.mp4",
+                                        cookie = null,
+                                        userAgent = userAgent,
+                                        referer = item.canonicalUrl,
+                                        originalSourceUrl = item.canonicalUrl,
+                                        kind = DownloadKind.YOUTUBE_JIT,
+                                        sourceProfile = "best_progressive"
+                                    )
+                                }
+                                onAddBatch(requests)
+                                selectedPlaylistUrls.clear()
+                                showYouTubeDialog = false
+                            }
+                        ) { Text("Añadir selección a la cola") }
+                    }
                 }
             },
             confirmButton = {
-                if (youtubeDetails == null && !youtubeLoading && link.isVideo) {
+                if (youtubeDetails == null && youtubePlaylistDetails == null && !youtubeLoading) {
                     Button(onClick = { analyzeYouTube(link) }) { Text("Analizar") }
                 } else {
                     TextButton(enabled = !youtubeLoading, onClick = { showYouTubeDialog = false }) { Text("Cerrar") }
@@ -957,18 +1094,41 @@ fun BrowserScreen(
                     if (!item.downloadable) {
                         Text(
                             if (item.kind == DetectedMediaKind.STREAM) {
-                                "Es un manifiesto HLS/DASH, no un archivo de video completo. Se detecta para análisis, pero no se guarda como .txt ni se añade al motor HTTP directo."
+                                "Es un manifiesto HLS/DASH, no un archivo de video completo. El detector puede analizar un HLS Master y mostrar sus variantes sin guardar el manifiesto como .txt."
                             } else {
                                 "Es una URL blob interna de la página. WebView no expone sus bytes como un archivo HTTP directo; se muestra solo como diagnóstico."
                             },
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
+                        if (item.kind == DetectedMediaKind.STREAM && streamAnalyzedUrl == item.url) {
+                            if (streamLoading) {
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    CircularProgressIndicator()
+                                    Text("Analizando manifiesto…")
+                                }
+                            }
+                            streamError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                            streamVariants.take(12).forEach { variant ->
+                                Text(
+                                    "• ${variant.qualityLabel} · ${variant.bandwidth / 1000} kbps${variant.codecs?.let { " · $it" } ?: ""}",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                            if (!streamLoading && streamError == null && streamVariants.isEmpty()) {
+                                Text("El HLS no expone variantes Master; puede ser una playlist de medios directa.", style = MaterialTheme.typography.bodySmall)
+                            }
+                        }
                     }
                 }
             },
             confirmButton = {
-                if (item.downloadable) {
+                if (item.kind == DetectedMediaKind.STREAM && item.url.contains(".m3u8", true)) {
+                    Button(
+                        enabled = !streamLoading,
+                        onClick = { analyzeStream(item) }
+                    ) { Text(if (streamAnalyzedUrl == item.url) "Reanalizar calidades" else "Analizar calidades") }
+                } else if (item.downloadable) {
                     Button(
                         onClick = {
                             onAdd(item.url, item.filename, item.cookie, item.userAgent, item.referer, null, null)
@@ -982,6 +1142,8 @@ fun BrowserScreen(
             dismissButton = {
                 if (item.downloadable) {
                     TextButton(onClick = { detected = null }) { Text("Cancelar") }
+                } else if (item.kind == DetectedMediaKind.STREAM) {
+                    TextButton(onClick = { detected = null }) { Text("Cerrar") }
                 }
             }
         )
@@ -1162,6 +1324,11 @@ private class MediaSnifferBridge(
 private fun installBoundedMediaSniffer(view: WebView) {
     if (!view.isAttachedToWindow) return
     runCatching { view.evaluateJavascript(MEDIA_SNIFFER_SCRIPT, null) }
+}
+
+private fun triggerActiveQualityRescan(view: WebView?) {
+    if (view == null || !view.isAttachedToWindow) return
+    runCatching { view.evaluateJavascript("window.__rescanActivePlayerQualities && window.__rescanActivePlayerQualities();", null) }
 }
 
 private fun destroyDeadWebView(view: WebView?) {
@@ -1418,6 +1585,38 @@ private const val MEDIA_SNIFFER_SCRIPT = """
       } catch (_) {}
     }
 
+    const streamRx = /\.(m3u8|mpd)(?:$|[?#])/i;
+    const originalFetch = window.fetch;
+    const originalXhrOpen = XMLHttpRequest.prototype.open;
+
+    if (originalFetch) {
+      window.fetch = function(...args) {
+        try {
+          const candidate = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url ? args[0].url : '');
+          if (candidate && streamRx.test(candidate)) report(candidate, 'stream_fetch');
+        } catch (_) {}
+        return originalFetch.apply(this, args);
+      };
+    }
+
+    XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+      try { if (url && streamRx.test(String(url))) report(String(url), 'stream_xhr'); } catch (_) {}
+      return originalXhrOpen.call(this, method, url, ...rest);
+    };
+
+    window.__rescanActivePlayerQualities = function() {
+      try {
+        document.querySelectorAll('video,audio,source').forEach(function(el) {
+          report(el.currentSrc || el.src || el.getAttribute('src'), 'active_player');
+        });
+        if (window.videojs && window.videojs.getAllPlayers) {
+          window.videojs.getAllPlayers().forEach(function(player) {
+            try { report(player.currentSrc(), 'videojs'); } catch (_) {}
+          });
+        }
+      } catch (_) {}
+    };
+
     function inspectElement(el) {
       if (!el || el.nodeType !== 1 || seen.size >= MAX) return;
       const tag = (el.tagName || '').toUpperCase();
@@ -1467,12 +1666,17 @@ private const val MEDIA_SNIFFER_SCRIPT = """
     const timer = setTimeout(function() {
       try { observer.disconnect(); } catch (_) {}
       try { if (URL.createObjectURL === patchedCreate) URL.createObjectURL = originalCreate; } catch (_) {}
+      try { if (originalFetch && window.fetch !== originalFetch) window.fetch = originalFetch; } catch (_) {}
+      try { if (XMLHttpRequest.prototype.open !== originalXhrOpen) XMLHttpRequest.prototype.open = originalXhrOpen; } catch (_) {}
     }, 15000);
 
     window.__managerDownloaderSnifferCleanup = function() {
       try { observer.disconnect(); } catch (_) {}
       try { clearTimeout(timer); } catch (_) {}
       try { if (URL.createObjectURL === patchedCreate) URL.createObjectURL = originalCreate; } catch (_) {}
+      try { if (originalFetch && window.fetch !== originalFetch) window.fetch = originalFetch; } catch (_) {}
+      try { if (XMLHttpRequest.prototype.open !== originalXhrOpen) XMLHttpRequest.prototype.open = originalXhrOpen; } catch (_) {}
+      try { delete window.__rescanActivePlayerQualities; } catch (_) {}
     };
   } catch (_) {}
 })();

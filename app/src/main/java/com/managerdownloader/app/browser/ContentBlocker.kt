@@ -220,7 +220,7 @@ object ContentBlocker {
     private fun downloadRules(url: String, limit: Int): Set<String> = runCatching {
         val request = Request.Builder()
             .url(url)
-            .header("User-Agent", "ManagerDownloader/0.7.5")
+            .header("User-Agent", "ManagerDownloader/0.8.0")
             .get()
             .build()
         client.newCall(request).execute().use { response ->
@@ -258,8 +258,9 @@ object ContentBlocker {
                 continue
             }
 
-            if (line.startsWith("0.0.0.0 ") || line.startsWith("127.0.0.1 ")) {
-                val domain = line.substringAfter(' ').trim().substringBefore(' ').lowercase(Locale.US)
+            val hostsParts = line.split(Regex("\\s+"), limit = 3)
+            if (hostsParts.size >= 2 && hostsParts[0] in setOf("0.0.0.0", "127.0.0.1")) {
+                val domain = hostsParts[1].trim().lowercase(Locale.US)
                 if (isDomain(domain)) add(domain)
             }
         }

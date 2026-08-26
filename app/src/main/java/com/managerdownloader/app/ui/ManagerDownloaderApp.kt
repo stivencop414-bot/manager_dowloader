@@ -37,7 +37,10 @@ fun ManagerDownloaderApp(
     onOpenTorrentFile: () -> Unit,
     onMoveCompleted: (String) -> Unit,
     incomingBrowserUrl: String? = null,
-    onIncomingBrowserUrlConsumed: () -> Unit = {}
+    onIncomingBrowserUrlConsumed: () -> Unit = {},
+    clipboardCandidate: String? = null,
+    onClipboardAccept: (String) -> Unit = {},
+    onClipboardDismiss: (String) -> Unit = {}
 ) {
     val settings by SettingsRepository.settings.collectAsState()
     ManagerTheme(settings.themeMode) {
@@ -117,6 +120,20 @@ fun ManagerDownloaderApp(
             }
         }
 
+        clipboardCandidate?.let { candidate ->
+            AlertDialog(
+                onDismissRequest = { onClipboardDismiss(candidate) },
+                title = { Text("Enlace detectado en el portapapeles") },
+                text = { Text(candidate, maxLines = 5) },
+                confirmButton = {
+                    Button(onClick = { onClipboardAccept(candidate) }) { Text("Abrir en Manager") }
+                },
+                dismissButton = {
+                    androidx.compose.material3.TextButton(onClick = { onClipboardDismiss(candidate) }) { Text("Ignorar") }
+                }
+            )
+        }
+
         if (showStoragePrompt && selectedTree == null) {
             AlertDialog(
                 onDismissRequest = {
@@ -179,7 +196,12 @@ fun enqueueBatch(context: Context, requests: List<BrowserDownloadRequest>) {
             userAgent = request.userAgent,
             referer = request.referer,
             originalSourceUrl = request.originalSourceUrl,
-            sourceFormatId = request.sourceFormatId
+            sourceFormatId = request.sourceFormatId,
+            kind = request.kind,
+            secondaryUrl = request.secondaryUrl,
+            secondarySourceFormatId = request.secondarySourceFormatId,
+            muxContainer = request.muxContainer,
+            sourceProfile = request.sourceProfile
         )
     }
     DownloadService.process(context)

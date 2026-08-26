@@ -24,7 +24,7 @@ android {
 
         versionName = providers.gradleProperty("VERSION_NAME")
             .orNull
-            ?: "0.7.5"
+            ?: "0.8.0"
     }
 
     signingConfigs {

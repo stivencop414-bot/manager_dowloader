@@ -94,7 +94,8 @@ internal class TorrentEngine(
                     return
                 }
 
-                val status = torrentHandle.status()
+                if (!runCatching { torrentHandle.isValid }.getOrDefault(false)) return
+                val status = runCatching { torrentHandle.status() }.getOrNull() ?: return
                 val total = status.totalWanted().takeIf { it > 0L }
                     ?: info.totalSize()
                 val done = status.totalWantedDone().coerceAtLeast(status.totalDone())

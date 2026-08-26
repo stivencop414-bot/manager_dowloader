@@ -47,6 +47,18 @@ data class YouTubeFormatOption(
     val bitrateKbps: Int = -1
 )
 
+data class YouTubeMuxedOption(
+    val id: String,
+    val label: String,
+    val videoUrl: String,
+    val audioUrl: String,
+    val filename: String,
+    val videoFormatId: String,
+    val audioFormatId: String,
+    val container: String,
+    val height: Int
+)
+
 data class YouTubeVideoDetails(
     val sourceUrl: String,
     val title: String,
@@ -56,6 +68,7 @@ data class YouTubeVideoDetails(
     val progressiveVideo: List<YouTubeFormatOption>,
     val videoOnly: List<YouTubeFormatOption>,
     val audioOnly: List<YouTubeFormatOption>,
+    val muxedHighQuality: List<YouTubeMuxedOption>,
     val warnings: List<String>
 )
 
@@ -110,7 +123,7 @@ object YouTubeExtractorClient {
         }
     }
 
-    private fun ensureInitialized() {
+    internal fun ensureInitialized() {
         if (initialized) return
         synchronized(initLock) {
             if (initialized) return
@@ -145,9 +158,11 @@ object YouTubeExtractorClient {
             .sortedByDescending { it.bitrateKbps }
             .toList()
 
+        val muxed = buildMuxedOptions(videoOnly, audio, safeTitle)
+
         val warnings = buildList {
-            if (progressive.isEmpty() && videoOnly.isNotEmpty()) {
-                add("Este video solo expone pistas separadas de video/audio; la fusión de alta calidad todavía no está habilitada.")
+            if (progressive.isEmpty() && muxed.isEmpty() && videoOnly.isNotEmpty()) {
+                add("Este video expone pistas separadas, pero no se encontró una combinación compatible para MediaMuxer.")
             }
             if (info.ageLimit > 0) add("El contenido informa restricción por edad (${info.ageLimit}+).")
             if (info.errors.isNotEmpty()) add("El extractor reportó ${info.errors.size} advertencia(s) parcial(es).")
@@ -162,6 +177,7 @@ object YouTubeExtractorClient {
             progressiveVideo = progressive,
             videoOnly = videoOnly,
             audioOnly = audio,
+            muxedHighQuality = muxed,
             warnings = warnings
         )
     }
@@ -207,6 +223,43 @@ object YouTubeExtractorClient {
             bitrateKbps = bitrate
         )
     }
+
+    private fun buildMuxedOptions(
+        videoOnly: List<YouTubeFormatOption>,
+        audioOnly: List<YouTubeFormatOption>,
+        title: String
+    ): List<YouTubeMuxedOption> = videoOnly.mapNotNull { video ->
+        val container = when {
+            video.mimeType.contains("webm", true) || video.filename.endsWith(".webm", true) -> "webm"
+            video.mimeType.contains("mp4", true) || video.filename.endsWith(".mp4", true) || video.filename.endsWith(".m4v", true) -> "mp4"
+            else -> null
+        } ?: return@mapNotNull null
+
+        val audio = audioOnly.firstOrNull { candidate ->
+            when (container) {
+                "webm" -> candidate.mimeType.contains("webm", true) ||
+                    candidate.filename.endsWith(".webm", true) || candidate.filename.endsWith(".opus", true)
+                else -> candidate.mimeType.contains("mp4", true) ||
+                    candidate.filename.endsWith(".m4a", true) || candidate.filename.endsWith(".mp4", true)
+            }
+        } ?: return@mapNotNull null
+
+        YouTubeMuxedOption(
+            id = "${video.id}+${audio.id}",
+            label = buildString {
+                append(if (video.height > 0) "${video.height}p" else "Alta calidad")
+                append(" · ${container.uppercase(Locale.US)} · video + audio")
+            },
+            videoUrl = video.url,
+            audioUrl = audio.url,
+            filename = "$title.$container",
+            videoFormatId = video.id,
+            audioFormatId = audio.id,
+            container = container,
+            height = video.height
+        )
+    }.distinctBy { "${it.height}:${it.container}" }
+        .sortedByDescending { it.height }
 
     private fun sanitizeFileName(value: String): String = value
         .replace(Regex("""[\\/:*?\"<>|]"""), "_")

@@ -10,7 +10,9 @@ enum class DownloadStatus {
 
 enum class DownloadKind {
     HTTP,
-    TORRENT
+    TORRENT,
+    YOUTUBE_JIT,
+    YOUTUBE_MUXED
 }
 
 data class DownloadTask(
@@ -33,8 +35,15 @@ data class DownloadTask(
     val actualSha256: String? = null,
     /** Original page URL used to refresh short-lived extracted stream URLs (for example YouTube). */
     val originalSourceUrl: String? = null,
-    /** Extractor-specific format id/itag used to refresh an expired stream URL. */
-    val sourceFormatId: String? = null
+    /** Extractor-specific primary format id/itag used to refresh an expired stream URL. */
+    val sourceFormatId: String? = null,
+    /** Optional second stream used by native video+audio mux jobs. */
+    val secondaryUrl: String? = null,
+    val secondarySourceFormatId: String? = null,
+    /** mp4 or webm for native MediaMuxer jobs. */
+    val muxContainer: String? = null,
+    /** Logical JIT profile used for playlist/channel queue entries. */
+    val sourceProfile: String? = null
 ) {
     val progress: Float
         get() = if (totalBytes > 0) {

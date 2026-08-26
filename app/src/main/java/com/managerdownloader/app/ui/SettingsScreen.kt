@@ -280,7 +280,15 @@ fun SettingsScreen(
                 fontSize = 12.sp
             )
             Text(
-                "Video+audio combinado y audio-only pueden descargarse. Las pistas de alta calidad separadas se muestran, pero requieren un muxer para generar un archivo final con audio.",
+                "Video+audio combinado y audio-only pueden descargarse. Las pistas separadas compatibles de alta calidad se descargan y fusionan localmente con MediaMuxer para generar un archivo final con audio.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 12.sp
+            )
+        }
+
+        SettingsCard(title = "Portapapeles") {
+            Text(
+                "Cuando Manager Downloader recupera el foco, puede detectar URLs HTTP/HTTPS o magnet copiadas y pedir confirmación antes de abrirlas. Android 10+ no permite lectura permanente del portapapeles en segundo plano.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 fontSize = 12.sp
             )

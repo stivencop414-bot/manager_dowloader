@@ -740,7 +740,13 @@ private fun normalizeUrl(value: String): String? {
     } else {
         "https://$trimmed"
     }
-    return candidate.takeIf { runCatching { java.net.URI(it).host != null }.getOrDefault(false) }
+    return candidate.takeIf {
+        runCatching {
+            val parsed = android.net.Uri.parse(it)
+            !parsed.host.isNullOrBlank() &&
+                (parsed.scheme.equals("http", true) || parsed.scheme.equals("https", true))
+        }.getOrDefault(false)
+    }
 }
 
 private fun statusLabel(status: DownloadStatus): String = when (status) {

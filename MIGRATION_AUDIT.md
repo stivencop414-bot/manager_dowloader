@@ -1,3 +1,9 @@
+# Auditoría aplicada — v0.8.0
+
+Base auditada: v0.7.5. Esta actualización conserva la arquitectura y los mecanismos de reanudación/AtomicFile/SafePowerManager existentes, y añade funciones mediante campos opcionales y módulos aislados. La compilación de GitHub Actions es obligatoria antes de hacer commit.
+
+Decisión deliberada: el monitor de portapapeles se limita al primer plano porque Android 10+ restringe la lectura del portapapeles en background. HLS Master se analiza y muestra por calidad, pero no se presenta un manifiesto como si fuera un archivo MP4 directo.
+
 # Auditoría aplicada — v0.7.5
 
 Base confirmada: v0.7.3 en `main`, commit `335c2e6906cb20faec61fce1cc600c89ab46bc58`.

@@ -108,8 +108,7 @@ object StorageRepository {
                 appContext.contentResolver.openOutputStream(target.uri, "w")?.use { output ->
                     FileInputStream(source).use { input -> input.copyTo(output, 512 * 1024) }
                 } ?: throw IOException("No se pudo escribir en la carpeta seleccionada")
-                val size = source.length()
-                if (size > 0L) source.delete()
+                runCatching { source.delete() }
                 return target.uri.toString()
             }
         }

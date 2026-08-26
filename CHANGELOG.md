@@ -1,3 +1,24 @@
+# Manager Downloader v0.8.0
+
+## Auditoría aplicada
+- 8 parches de estabilidad del informe maestro v0.7.5 → v0.8.0.
+- HTTP cleartext habilitado deliberadamente para mirrors/NAS/trackers no TLS.
+- Importación segura de .torrent SAF y ACTION_VIEW HTTP/HTTPS hacia el navegador integrado.
+- Validación defensiva de TorrentHandle JNI.
+
+## Video
+- Alta calidad YouTube con pistas separadas de video+audio y fusión nativa MediaMuxer MP4/WebM sin recodificación.
+- URLs temporales de formatos HD se refrescan al comenzar el trabajo.
+- Playlists de YouTube se extraen con paginación y se encolan como trabajos JIT para no guardar URLs directas caducables.
+- Sniffer web intercepta fetch/XHR para HLS/DASH, permite rescaneo reactivo y analiza variantes de HLS Master.
+
+## Portapapeles
+- Detección únicamente cuando la app está en primer plano/con foco, respetando las restricciones de Android 10+. No se promete monitoreo global en background.
+
+## Compatibilidad
+- El modelo persistido añade solo campos opcionales; las colas v0.7.5 siguen cargando.
+- No se intenta eludir DRM, autenticación, contenido privado ni controles de acceso.
+
 # Manager Downloader v0.7.5
 
 ## Enfoque

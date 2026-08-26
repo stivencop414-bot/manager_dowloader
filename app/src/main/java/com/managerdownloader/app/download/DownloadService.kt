@@ -26,6 +26,7 @@ import com.managerdownloader.app.data.DownloadTask
 import com.managerdownloader.app.data.QueueMode
 import com.managerdownloader.app.data.SettingsRepository
 import com.managerdownloader.app.data.StorageRepository
+import com.managerdownloader.app.media.NativeMediaMuxerEngine
 import com.managerdownloader.app.youtube.YouTubeExtractorClient
 import java.io.BufferedInputStream
 import java.io.File
@@ -277,7 +278,12 @@ class DownloadService : Service() {
 
                     DownloadRepository.markActive(
                         task.id,
-                        if (task.kind == DownloadKind.TORRENT) "Preparando torrent…" else "Analizando servidor…"
+                        when (task.kind) {
+                            DownloadKind.TORRENT -> "Preparando torrent…"
+                            DownloadKind.YOUTUBE_JIT -> "Resolviendo YouTube justo a tiempo…"
+                            DownloadKind.YOUTUBE_MUXED -> "Preparando video HD + audio…"
+                            DownloadKind.HTTP -> "Analizando servidor…"
+                        }
                     )
 
                     transferExecutor.execute {
@@ -285,6 +291,8 @@ class DownloadService : Service() {
                             when (task.kind) {
                                 DownloadKind.HTTP -> downloadHttp(task, control)
                                 DownloadKind.TORRENT -> torrentEngine.download(task, control, limit)
+                                DownloadKind.YOUTUBE_JIT -> downloadYouTubeJit(task, control)
+                                DownloadKind.YOUTUBE_MUXED -> downloadYouTubeMuxed(task, control)
                             }
                         } catch (error: Throwable) {
                             val current = DownloadRepository.find(task.id)
@@ -333,13 +341,12 @@ class DownloadService : Service() {
                 downloadHttpAttempt(task, control)
                 return
             } catch (error: HttpStatusException) {
-                if (
-                    error.statusCode == 403 &&
-                    !refreshedTemporaryUrl &&
+                val refreshed = if (error.statusCode == 403 && !refreshedTemporaryUrl) {
                     refreshExpiredExtractedStream(task)
-                ) {
+                } else null
+                if (refreshed != null) {
                     refreshedTemporaryUrl = true
-                    task = DownloadRepository.find(task.id) ?: task
+                    task = refreshed
                     DownloadRepository.updateMetadata(task.id, detail = "Enlace temporal renovado · reanudando")
                     continue
                 }
@@ -394,18 +401,18 @@ class DownloadService : Service() {
         }
     }
 
-    private fun refreshExpiredExtractedStream(task: DownloadTask): Boolean {
-        val sourceUrl = task.originalSourceUrl?.takeIf { it.isNotBlank() } ?: return false
-        val details = runBlocking { YouTubeExtractorClient.analyze(sourceUrl) }.getOrNull() ?: return false
+    private fun refreshExpiredExtractedStream(task: DownloadTask): DownloadTask? {
+        val sourceUrl = task.originalSourceUrl?.takeIf { it.isNotBlank() } ?: return null
+        val details = runBlocking { YouTubeExtractorClient.analyze(sourceUrl) }.getOrNull() ?: return null
         val options = details.progressiveVideo + details.audioOnly + details.videoOnly
-        if (options.isEmpty()) return false
+        if (options.isEmpty()) return null
 
         val selected = task.sourceFormatId?.let { wantedId ->
             options.firstOrNull { it.id == wantedId }
         } ?: run {
             val ext = task.filename.substringAfterLast('.', "").lowercase()
             options.firstOrNull { it.filename.substringAfterLast('.', "").equals(ext, true) }
-        } ?: return false
+        } ?: return null
 
         DownloadRepository.updateUrl(
             id = task.id,
@@ -414,7 +421,225 @@ class DownloadService : Service() {
             userAgent = task.userAgent,
             referer = sourceUrl
         )
-        return true
+        return task.copy(url = selected.url, sourceFormatId = selected.id, referer = sourceUrl)
+    }
+
+    private fun downloadYouTubeJit(task: DownloadTask, control: TransferControl) {
+        val sourceUrl = task.originalSourceUrl?.takeIf { it.isNotBlank() } ?: task.url
+        val details = runBlocking { YouTubeExtractorClient.analyze(sourceUrl) }
+            .getOrElse { throw IOException(it.message ?: "No se pudo analizar YouTube") }
+        if (control.stopped.get()) return
+
+        val profile = task.sourceProfile ?: "best_progressive"
+        val selected = when (profile) {
+            "best_audio" -> details.audioOnly.firstOrNull()
+            else -> details.progressiveVideo.firstOrNull()
+        }
+
+        if (selected != null) {
+            DownloadRepository.updateMetadata(task.id, filename = selected.filename, detail = "YouTube JIT · formato resuelto")
+            downloadHttp(
+                task.copy(
+                    url = selected.url,
+                    filename = selected.filename,
+                    kind = DownloadKind.HTTP,
+                    originalSourceUrl = sourceUrl,
+                    sourceFormatId = selected.id,
+                    referer = sourceUrl
+                ),
+                control
+            )
+            return
+        }
+
+        val muxed = details.muxedHighQuality.firstOrNull()
+            ?: throw IOException("YouTube no expuso un formato descargable compatible")
+        downloadYouTubeMuxed(
+            task.copy(
+                kind = DownloadKind.YOUTUBE_MUXED,
+                url = muxed.videoUrl,
+                secondaryUrl = muxed.audioUrl,
+                filename = muxed.filename,
+                sourceFormatId = muxed.videoFormatId,
+                secondarySourceFormatId = muxed.audioFormatId,
+                muxContainer = muxed.container,
+                originalSourceUrl = sourceUrl,
+                referer = sourceUrl
+            ),
+            control
+        )
+    }
+
+    private fun refreshMuxedTask(task: DownloadTask): DownloadTask? {
+        val sourceUrl = task.originalSourceUrl?.takeIf { it.isNotBlank() } ?: return null
+        val details = runBlocking { YouTubeExtractorClient.analyze(sourceUrl) }.getOrNull() ?: return null
+        val selected = details.muxedHighQuality.firstOrNull { option ->
+            option.videoFormatId == task.sourceFormatId &&
+                option.audioFormatId == task.secondarySourceFormatId
+        } ?: return null
+
+        DownloadRepository.updateMuxUrls(
+            id = task.id,
+            videoUrl = selected.videoUrl,
+            audioUrl = selected.audioUrl,
+            videoFormatId = selected.videoFormatId,
+            audioFormatId = selected.audioFormatId,
+            container = selected.container,
+            filename = selected.filename
+        )
+        return task.copy(
+            url = selected.videoUrl,
+            secondaryUrl = selected.audioUrl,
+            sourceFormatId = selected.videoFormatId,
+            secondarySourceFormatId = selected.audioFormatId,
+            muxContainer = selected.container,
+            filename = selected.filename,
+            referer = sourceUrl
+        )
+    }
+
+    private fun downloadYouTubeMuxed(initialTask: DownloadTask, control: TransferControl) {
+        var task = refreshMuxedTask(initialTask) ?: initialTask
+        val audioUrlInitial = task.secondaryUrl?.takeIf { it.isNotBlank() }
+            ?: throw IOException("Falta la pista de audio para fusionar")
+        val container = task.muxContainer?.lowercase()?.takeIf { it == "mp4" || it == "webm" } ?: "mp4"
+        val videoPart = youtubeVideoFile(task.id)
+        val audioPart = youtubeAudioFile(task.id)
+        val muxPart = youtubeMuxFile(task.id, container)
+
+        DownloadRepository.updateMetadata(task.id, filename = task.filename, detail = "YouTube HD · descargando video")
+        try {
+            downloadStagingStream(task, task.url, videoPart, control, "Video HD")
+        } catch (error: HttpStatusException) {
+            if (error.statusCode != 403 || control.stopped.get()) throw error
+            task = refreshMuxedTask(task) ?: throw error
+            downloadStagingStream(task, task.url, videoPart, control, "Video HD")
+        }
+        if (control.stopped.get()) return
+
+        task = refreshMuxedTask(task) ?: task
+        val audioUrl = task.secondaryUrl?.takeIf { it.isNotBlank() } ?: audioUrlInitial
+        DownloadRepository.updateMetadata(task.id, detail = "YouTube HD · descargando audio")
+        try {
+            downloadStagingStream(task, audioUrl, audioPart, control, "Audio")
+        } catch (error: HttpStatusException) {
+            if (error.statusCode != 403 || control.stopped.get()) throw error
+            task = refreshMuxedTask(task) ?: throw error
+            downloadStagingStream(task, task.secondaryUrl ?: audioUrl, audioPart, control, "Audio")
+        }
+        if (control.stopped.get()) return
+
+        val stagingBytes = videoPart.length() + audioPart.length()
+        DownloadRepository.updateMetadata(task.id, detail = "Fusionando video + audio · ${container.uppercase()}")
+        val muxResult = NativeMediaMuxerEngine.mux(
+            videoFile = videoPart,
+            audioFile = audioPart,
+            outputFile = muxPart,
+            container = container,
+            shouldStop = { control.stopped.get() },
+            onProgress = { fraction ->
+                DownloadRepository.updateProgress(
+                    task.id,
+                    (stagingBytes * fraction).toLong(),
+                    stagingBytes.coerceAtLeast(1L),
+                    0L,
+                    "Fusionando · ${(fraction * 100).toInt()}%"
+                )
+            }
+        )
+        if (muxResult.isFailure) {
+            runCatching { muxPart.delete() }
+            if (control.stopped.get()) return
+            throw IOException(muxResult.exceptionOrNull()?.message ?: "Falló la fusión de audio y video")
+        }
+
+        val finalName = DownloadRepository.find(task.id)?.filename ?: task.filename
+        val completedBytes = muxPart.length()
+        val publishedPath = StorageRepository.publishFile(muxPart, finalName, downloadsDirectory())
+        runCatching { videoPart.delete() }
+        runCatching { audioPart.delete() }
+        DownloadRepository.markCompleted(task.id, publishedPath, completedBytes)
+        showCompletedNotification(finalName)
+    }
+
+    private fun downloadStagingStream(
+        task: DownloadTask,
+        url: String,
+        target: File,
+        control: TransferControl,
+        label: String
+    ) {
+        target.parentFile?.mkdirs()
+        var existing = target.length().coerceAtLeast(0L)
+        val builder = Request.Builder().url(url).header("Accept-Encoding", "identity").get()
+        task.cookie?.takeIf { it.isNotBlank() }?.let { builder.header("Cookie", it) }
+        task.userAgent?.takeIf { it.isNotBlank() }?.let { builder.header("User-Agent", it) }
+        task.referer?.takeIf { it.isNotBlank() }?.let { builder.header("Referer", it) }
+        if (existing > 0L) builder.header("Range", "bytes=$existing-")
+
+        val call = client.newCall(builder.build())
+        control.calls.add(call)
+        try {
+            call.execute().use { response ->
+                if (!response.isSuccessful) throw HttpStatusException(response.code, "HTTP ${response.code} al descargar $label")
+                if (existing > 0L && response.code == 200) {
+                    RandomAccessFile(target, "rw").use { it.setLength(0L) }
+                    existing = 0L
+                } else if (existing > 0L && response.code == 206) {
+                    val range = parseContentRange(response.header("Content-Range"))
+                        ?: throw IOException("Content-Range inválido al reanudar $label")
+                    if (range.start != existing) throw IOException("$label reanudó desde ${range.start}, se esperaba $existing")
+                }
+
+                val body = response.body ?: throw IOException("Respuesta vacía al descargar $label")
+                val total = parseContentRange(response.header("Content-Range"))?.total
+                    ?: body.contentLength().takeIf { it > 0L }?.plus(existing)
+                    ?: -1L
+                if (total > 0L) ensureStagingSpace(target, total)
+                var downloaded = existing
+                var lastBytes = downloaded
+                var lastTime = System.currentTimeMillis()
+
+                RandomAccessFile(target, "rw").use { output ->
+                    output.seek(existing)
+                    val buffer = ByteArray(256 * 1024)
+                    body.byteStream().use { input ->
+                        while (!control.stopped.get()) {
+                            val read = input.read(buffer)
+                            if (read == -1) break
+                            if (!ensureNetworkPolicy(task.id, control)) break
+                            bandwidthLimiter.acquire(read)
+                            output.write(buffer, 0, read)
+                            downloaded += read
+                            val now = System.currentTimeMillis()
+                            if (now - lastTime >= 500L) {
+                                val speed = ((downloaded - lastBytes) * 1000L) / (now - lastTime).coerceAtLeast(1L)
+                                DownloadRepository.updateProgress(task.id, downloaded, total, speed, label)
+                                lastBytes = downloaded
+                                lastTime = now
+                                updateAggregateNotificationThrottled(now)
+                            }
+                        }
+                    }
+                }
+
+                if (!control.stopped.get() && total > 0L && target.length() < total) {
+                    throw IOException("$label quedó incompleto")
+                }
+            }
+        } finally {
+            control.calls.remove(call)
+        }
+    }
+
+    private fun ensureStagingSpace(target: File, total: Long) {
+        if (total <= 0L) return
+        val remaining = (total - target.length()).coerceAtLeast(0L)
+        val reserve = 32L * 1024L * 1024L
+        val usable = downloadsDirectory().usableSpace
+        if (usable in 0 until (remaining + reserve)) {
+            throw IOException("Espacio insuficiente para completar las pistas de video")
+        }
     }
 
     private data class HttpProbe(
@@ -1112,7 +1337,7 @@ class DownloadService : Service() {
         }
         val remaining = (totalBytes - alreadyDownloaded).coerceAtLeast(0L)
         val reserve = 32L * 1024L * 1024L
-        if (dir.usableSpace in 1 until (remaining + reserve)) {
+        if (dir.usableSpace in 0 until (remaining + reserve)) {
             throw IOException("Espacio insuficiente. Se necesitan aproximadamente ${formatBytes(remaining + reserve)} libres")
         }
     }
@@ -1174,9 +1399,15 @@ class DownloadService : Service() {
     private fun segmentFile(id: String, index: Int): File = File(downloadsDirectory(), ".$id.seg$index")
     private fun segmentMetaFile(id: String): File = File(downloadsDirectory(), ".$id.segments")
     private fun singleMetaFile(id: String): File = File(downloadsDirectory(), ".$id.singlemeta")
+    private fun youtubeVideoFile(id: String): File = File(downloadsDirectory(), ".$id.yt-video.part")
+    private fun youtubeAudioFile(id: String): File = File(downloadsDirectory(), ".$id.yt-audio.part")
+    private fun youtubeMuxFile(id: String, container: String): File = File(downloadsDirectory(), ".$id.muxing.$container")
 
     private fun cleanupHttpParts(id: String) {
         runCatching { partialFile(id).delete() }
+        runCatching { youtubeVideoFile(id).delete() }
+        runCatching { youtubeAudioFile(id).delete() }
+        downloadsDirectory().listFiles()?.filter { it.name.startsWith(".$id.muxing.") }?.forEach { runCatching { it.delete() } }
         runCatching { singleMetaFile(id).delete() }
         cleanupSegmentedState(id, deletePart = false)
     }

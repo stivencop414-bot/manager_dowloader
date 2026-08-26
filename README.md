@@ -1,6 +1,6 @@
 # Manager Downloader
 
-## v0.7.5
+## v0.8.0
 Administrador de descargas Android nativo en Kotlin + Jetpack Compose.
 
 Esta revisión prioriza estabilidad y corrige casos borde encontrados después de la auditoría de v0.7.3.
