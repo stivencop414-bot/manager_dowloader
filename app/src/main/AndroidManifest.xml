@@ -17,7 +17,7 @@
         android:label="Manager Downloader"
         android:supportsRtl="true"
         android:theme="@style/Theme.ManagerDownloader"
-        android:usesCleartextTraffic="true"
+        android:usesCleartextTraffic="false"
         android:networkSecurityConfig="@xml/network_security_config">
 
         <activity

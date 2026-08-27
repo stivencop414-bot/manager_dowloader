@@ -1,5 +1,6 @@
 package com.managerdownloader.app.hls
 
+import com.managerdownloader.app.security.SecurityUrlPolicy
 import java.net.URI
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
@@ -27,7 +28,8 @@ data class HlsVariantStream(
 
 object HlsManifestParser {
     fun parseMasterPlaylist(rawContent: String, manifestUrl: String): List<HlsVariantStream> {
-        val baseUri = runCatching { URI.create(manifestUrl) }.getOrNull()
+        val secureManifestUrl = SecurityUrlPolicy.requirePublicHttps(manifestUrl).toString()
+        val baseUri = URI.create(secureManifestUrl)
         val lines = rawContent.lineSequence().map(String::trim).filter(String::isNotBlank).toList()
         val variants = mutableListOf<HlsVariantStream>()
         var pending: Map<String, String>? = null
@@ -44,19 +46,18 @@ object HlsManifestParser {
                     val height = resolution?.getOrNull(1)?.toIntOrNull()
                     val resolved = runCatching {
                         val candidate = URI.create(line)
-                        when {
-                            candidate.isAbsolute -> candidate.toString()
-                            baseUri != null -> baseUri.resolve(candidate).toString()
-                            else -> line
-                        }
-                    }.getOrDefault(line)
-                    variants += HlsVariantStream(
-                        bandwidth = attrs["BANDWIDTH"]?.toLongOrNull() ?: 0L,
-                        width = width,
-                        height = height,
-                        codecs = attrs["CODECS"],
-                        url = resolved
-                    )
+                        val absolute = if (candidate.isAbsolute) candidate else baseUri.resolve(candidate)
+                        SecurityUrlPolicy.requirePublicHttps(absolute.toString()).toString()
+                    }.getOrNull()
+                    if (resolved != null) {
+                        variants += HlsVariantStream(
+                            bandwidth = attrs["BANDWIDTH"]?.toLongOrNull() ?: 0L,
+                            width = width,
+                            height = height,
+                            codecs = attrs["CODECS"],
+                            url = resolved
+                        )
+                    }
                     pending = null
                 }
             }
@@ -77,10 +78,11 @@ object HlsManifestParser {
 
 object HlsManifestClient {
     private val client = OkHttpClient.Builder()
+        .dns(SecurityUrlPolicy.publicDns)
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(25, TimeUnit.SECONDS)
         .followRedirects(true)
-        .followSslRedirects(true)
+        .followSslRedirects(false)
         .retryOnConnectionFailure(true)
         .build()
 
@@ -91,13 +93,17 @@ object HlsManifestClient {
         referer: String? = null
     ): Result<List<HlsVariantStream>> = withContext(Dispatchers.IO) {
         runCatching {
-            val builder = Request.Builder().url(url).get()
+            val safeUrl = SecurityUrlPolicy.requirePublicHttps(url)
+            val builder = Request.Builder().url(safeUrl).get()
             cookie?.takeIf(String::isNotBlank)?.let { builder.header("Cookie", it) }
             userAgent?.takeIf(String::isNotBlank)?.let { builder.header("User-Agent", it) }
-            referer?.takeIf(String::isNotBlank)?.let { builder.header("Referer", it) }
+            referer?.takeIf(String::isNotBlank)?.let { builder.header("Referer", it.take(8_192)) }
             client.newCall(builder.build()).execute().use { response ->
                 if (!response.isSuccessful) error("HTTP ${response.code} al analizar HLS")
-                val body = response.body?.string().orEmpty()
+                val body = SecurityUrlPolicy.readUtf8Limited(
+                    response.body,
+                    SecurityUrlPolicy.MAX_HLS_MANIFEST_BYTES
+                )
                 if (!body.contains("#EXTM3U", ignoreCase = true)) error("La respuesta no es un manifiesto HLS")
                 HlsManifestParser.parseMasterPlaylist(body, response.request.url.toString())
             }

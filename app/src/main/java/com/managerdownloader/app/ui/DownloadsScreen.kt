@@ -74,6 +74,7 @@ import com.managerdownloader.app.data.QueueMode
 import com.managerdownloader.app.data.SettingsRepository
 import com.managerdownloader.app.data.StorageRepository
 import com.managerdownloader.app.download.DownloadService
+import com.managerdownloader.app.security.SecurityUrlPolicy
 
 private enum class DownloadFilter(val label: String) {
     ALL("Todas"),
@@ -735,18 +736,9 @@ private fun RefreshLinkDialog(
 private fun normalizeUrl(value: String): String? {
     val trimmed = value.trim()
     if (trimmed.startsWith("magnet:", true)) return trimmed
-    val candidate = if (trimmed.startsWith("http://", true) || trimmed.startsWith("https://", true)) {
-        trimmed
-    } else {
-        "https://$trimmed"
-    }
-    return candidate.takeIf {
-        runCatching {
-            val parsed = android.net.Uri.parse(it)
-            !parsed.host.isNullOrBlank() &&
-                (parsed.scheme.equals("http", true) || parsed.scheme.equals("https", true))
-        }.getOrDefault(false)
-    }
+    if (trimmed.startsWith("http://", true)) return null
+    val candidate = if (trimmed.startsWith("https://", true)) trimmed else "https://$trimmed"
+    return candidate.takeIf { SecurityUrlPolicy.isSafePublicHttps(it) }
 }
 
 private fun statusLabel(status: DownloadStatus): String = when (status) {

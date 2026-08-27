@@ -8,7 +8,6 @@ import android.util.Log
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.webkit.CookieManager
-import android.webkit.JavascriptInterface
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.ServiceWorkerClient
 import android.webkit.ServiceWorkerController
@@ -21,6 +20,10 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.compose.foundation.horizontalScroll
+import androidx.webkit.JavaScriptReplyProxy
+import androidx.webkit.WebMessageCompat
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -89,6 +92,7 @@ import com.managerdownloader.app.data.DownloadKind
 import com.managerdownloader.app.data.SearchEngine
 import com.managerdownloader.app.data.SettingsRepository
 import com.managerdownloader.app.hls.HlsManifestClient
+import com.managerdownloader.app.security.SecurityUrlPolicy
 import com.managerdownloader.app.hls.HlsVariantStream
 import com.managerdownloader.app.youtube.YouTubeExtractorClient
 import com.managerdownloader.app.youtube.YouTubeFormatKind
@@ -161,7 +165,7 @@ fun BrowserScreen(
     val scope = rememberCoroutineScope()
 
     val initialBrowserUrl = remember(initialUrl, settings.searchEngine) {
-        initialUrl?.trim()?.takeIf { it.startsWith("http://", true) || it.startsWith("https://", true) }
+        initialUrl?.trim()?.takeIf { SecurityUrlPolicy.isSafePublicHttps(it) }
             ?: homeUrl(settings.searchEngine)
     }
     var webView by remember { mutableStateOf<WebView?>(null) }
@@ -198,6 +202,7 @@ fun BrowserScreen(
     fun rememberMedia(item: DetectedDownload) {
         if (!SettingsRepository.settings.value.mediaSnifferEnabled) return
         if (item.url.isBlank()) return
+        if (item.url.startsWith("https://", true) && !SecurityUrlPolicy.isSafePublicHttps(item.url)) return
         if (!MediaSnifferFilter.isCleanMediaCandidate(item.url)) return
 
         val canonicalKey = MediaSnifferFilter.canonicalMediaUrl(item.url)
@@ -273,7 +278,16 @@ fun BrowserScreen(
             return
         }
 
+        if (input.startsWith("http://", true)) {
+            pageError = "HTTP sin cifrar está bloqueado por seguridad. Usa HTTPS."
+            return
+        }
+
         val normalized = browserUrl(input, SettingsRepository.settings.value.searchEngine)
+        if (normalized.startsWith("https://", true) && !SecurityUrlPolicy.isSafePublicHttps(normalized)) {
+            pageError = "Destino local/privado bloqueado por seguridad."
+            return
+        }
         updateYouTubeLink(normalized)
         lastSearchInput = if (looksLikeAddress(input)) null else input
         if (normalized.substringBefore('?').endsWith(".torrent", true)) {
@@ -547,12 +561,16 @@ fun BrowserScreen(
                                 }
                                 runCatching { setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_BOUND, false) }
 
-                                runCatching {
-                                    addJavascriptInterface(
-                                        MediaSnifferBridge(
-                                            webViewProvider = { createdView },
+                                if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
+                                    WebViewCompat.addWebMessageListener(
+                                        this,
+                                        JS_BRIDGE_NAME,
+                                        setOf("*"),
+                                        SecureMediaBridgeListener(
+                                            activePageUrlProvider = { activePageUrlRef.get() },
+                                            browserSafeModeProvider = { browserSafeModeRef.get() },
                                             onFound = { rawUrl, typeHint ->
-                                                if (!browserSafeModeRef.get() && YouTubeUrlParser.parse(activePageUrlRef.get()) == null) {
+                                                if (YouTubeUrlParser.parse(activePageUrlRef.get()) == null) {
                                                     val kind = mediaKindForUrl(rawUrl, typeHint)
                                                     if (kind != null) {
                                                         rememberMedia(
@@ -566,8 +584,7 @@ fun BrowserScreen(
                                                     }
                                                 }
                                             }
-                                        ),
-                                        JS_BRIDGE_NAME
+                                        )
                                     )
                                 }
 
@@ -634,9 +651,18 @@ fun BrowserScreen(
                                             detected = detectedItem(url, view, referer = activePageUrlRef.get())
                                             return true
                                         }
-                                        if (url.startsWith("http://", true) || url.startsWith("https://", true) || url.startsWith("about:", true)) {
+                                        if (url.startsWith("http://", true)) {
+                                            pageError = "HTTP sin cifrar está bloqueado por seguridad."
+                                            return true
+                                        }
+                                        if (url.startsWith("https://", true)) {
+                                            if (!SecurityUrlPolicy.isSafePublicHttps(url)) {
+                                                pageError = "Destino local/privado bloqueado por seguridad."
+                                                return true
+                                            }
                                             return false
                                         }
+                                        if (url.startsWith("about:", true)) return false
                                         openExternal(context, url)
                                         return true
                                     }
@@ -721,7 +747,7 @@ fun BrowserScreen(
                                         } else {
                                             URLUtil.guessFileName(url, contentDisposition, mimeType)
                                         },
-                                        cookie = if (url.startsWith("http", true)) {
+                                        cookie = if (url.startsWith("https://", true)) {
                                             runCatching { CookieManager.getInstance().getCookie(url) }.getOrNull()
                                         } else {
                                             null
@@ -744,7 +770,7 @@ fun BrowserScreen(
                                 }
 
                                 val initial = rendererRecoveryUrl
-                                    ?.takeIf { it.startsWith("http://", true) || it.startsWith("https://", true) }
+                                    ?.takeIf { SecurityUrlPolicy.isSafePublicHttps(it) }
                                     ?: activePageUrlRef.get().takeIf { it.isNotBlank() }
                                     ?: homeUrl(SettingsRepository.settings.value.searchEngine)
                                 currentUrl = initial
@@ -1285,39 +1311,44 @@ private fun MediaBatchSheet(
     }
 }
 
-private class MediaSnifferBridge(
-    private val webViewProvider: () -> WebView?,
+private class SecureMediaBridgeListener(
+    private val activePageUrlProvider: () -> String,
+    private val browserSafeModeProvider: () -> Boolean,
     private val onFound: (String, String) -> Unit
-) {
+) : WebViewCompat.WebMessageListener {
     private val rateWindowStartedAt = AtomicLong(System.currentTimeMillis())
     private val callbacksInWindow = AtomicInteger(0)
 
-    @JavascriptInterface
-    fun onMediaFound(rawUrl: String?, typeHint: String?) {
-        val url = rawUrl?.trim().orEmpty()
-        if (url.isBlank() || url.length > MAX_SNIFFER_URL_LENGTH || url.startsWith("data:", true)) return
+    override fun onPostMessage(
+        view: WebView,
+        message: WebMessageCompat,
+        sourceOrigin: Uri,
+        isMainFrame: Boolean,
+        replyProxy: JavaScriptReplyProxy
+    ) {
+        if (!isMainFrame || browserSafeModeProvider()) return
+        if (message.type != WebMessageCompat.TYPE_STRING) return
+        if (!SecurityUrlPolicy.sameHttpsOrigin(activePageUrlProvider(), sourceOrigin)) return
+        val payload = message.data.orEmpty()
+        if (payload.length > MAX_SNIFFER_URL_LENGTH + 32) return
+        val separator = payload.indexOf('\n')
+        if (separator <= 0) return
+        val typeHint = payload.substring(0, separator).trim().take(24)
+        val url = payload.substring(separator + 1).trim()
+        if (url.isBlank() || url.length > MAX_SNIFFER_URL_LENGTH) return
         if (
-            !url.startsWith("http://", true) &&
-            !url.startsWith("https://", true) &&
             !url.startsWith("blob:", true) &&
-            !url.startsWith("magnet:", true)
+            !url.startsWith("magnet:", true) &&
+            !SecurityUrlPolicy.isSafePublicHttps(url)
         ) return
 
-        // The JS interface is reachable by page JavaScript. Cap callbacks so a buggy or hostile
-        // page cannot flood the Android main queue and make the browser look like it crashed.
         val now = System.currentTimeMillis()
         val windowStart = rateWindowStartedAt.get()
         if (now - windowStart >= SNIFFER_RATE_WINDOW_MS && rateWindowStartedAt.compareAndSet(windowStart, now)) {
             callbacksInWindow.set(0)
         }
         if (callbacksInWindow.incrementAndGet() > MAX_SNIFFER_CALLBACKS_PER_WINDOW) return
-
-        val view = webViewProvider() ?: return
-        view.post {
-            if (view.isAttachedToWindow) {
-                onFound(url, typeHint.orEmpty().take(24))
-            }
-        }
+        if (view.isAttachedToWindow) onFound(url, typeHint)
     }
 }
 
@@ -1334,6 +1365,11 @@ private fun triggerActiveQualityRescan(view: WebView?) {
 private fun destroyDeadWebView(view: WebView?) {
     if (view == null) return
     runCatching { (view.parent as? ViewGroup)?.removeView(view) }
+    runCatching {
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
+            WebViewCompat.removeWebMessageListener(view, JS_BRIDGE_NAME)
+        }
+    }
     runCatching { view.removeJavascriptInterface(JS_BRIDGE_NAME) }
     runCatching { view.destroy() }
 }
@@ -1342,6 +1378,11 @@ private fun cleanupWebView(view: WebView?) {
     if (view == null) return
     runCatching { (view.parent as? ViewGroup)?.removeView(view) }
     runCatching { view.stopLoading() }
+    runCatching {
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
+            WebViewCompat.removeWebMessageListener(view, JS_BRIDGE_NAME)
+        }
+    }
     runCatching { view.removeJavascriptInterface(JS_BRIDGE_NAME) }
     runCatching { view.webViewClient = WebViewClient() }
     runCatching { view.webChromeClient = null }
@@ -1369,7 +1410,7 @@ private fun detectedItem(
     return DetectedDownload(
         url = url,
         filename = name,
-        cookie = if (url.startsWith("http", true)) {
+        cookie = if (url.startsWith("https://", true)) {
             runCatching { CookieManager.getInstance().getCookie(url) }.getOrNull()
         } else {
             null
@@ -1387,7 +1428,8 @@ private fun mediaKindForUrl(url: String, typeHint: String?): DetectedMediaKind? 
         return DetectedMediaKind.BLOB
     }
     if (trimmed.startsWith("magnet:", true)) return DetectedMediaKind.DIRECT
-    if (!trimmed.startsWith("http://", true) && !trimmed.startsWith("https://", true)) return null
+    if (!trimmed.startsWith("https://", true)) return null
+    if (!SecurityUrlPolicy.isSafePublicHttps(trimmed)) return null
     if (!MediaSnifferFilter.isCleanMediaCandidate(trimmed)) return null
 
     val lower = trimmed.lowercase()
@@ -1406,8 +1448,7 @@ private fun magnetName(url: String): String = runCatching {
 }.getOrNull()?.takeIf { it.isNotBlank() } ?: "Magnet torrent"
 
 private fun isDownloadableScheme(url: String): Boolean =
-    url.startsWith("http://", true) ||
-        url.startsWith("https://", true) ||
+    (url.startsWith("https://", true) && SecurityUrlPolicy.isSafePublicHttps(url)) ||
         url.startsWith("magnet:", true)
 
 private fun isLikelyMediaUrl(url: String): Boolean =
@@ -1550,7 +1591,7 @@ private const val MEDIA_SNIFFER_SCRIPT = """
     }
 
     const bridge = window.ManagerSnifferBridge;
-    if (!bridge || !bridge.onMediaFound) return;
+    if (!bridge || !bridge.postMessage) return;
     const seen = new Set();
     const MAX = 40;
     const mediaRx = /\.(mp4|mkv|webm|avi|mov|m4v|3gp|mp3|m4a|aac|flac|wav|ogg|opus|m3u8|mpd|zip|pdf|apk|torrent)(?:$|[?#])/i;
@@ -1559,7 +1600,7 @@ private const val MEDIA_SNIFFER_SCRIPT = """
 
     function canonicalKey(url) {
       try {
-        if (!/^https?:/i.test(url)) return url;
+        if (!/^https:/i.test(url)) return url;
         const u = new URL(url);
         ['range', 'bytes', 'start', 'end'].forEach(function(name) { u.searchParams.delete(name); });
         u.hash = '';
@@ -1577,11 +1618,11 @@ private const val MEDIA_SNIFFER_SCRIPT = """
           absolute = new URL(raw, document.baseURI).href;
         }
         if (ignoredRx.test(absolute) || trackingRx.test(absolute)) return;
-        if (!/^https?:/i.test(absolute) && absolute.indexOf('blob:') !== 0 && absolute.indexOf('magnet:') !== 0) return;
+        if (!/^https:/i.test(absolute) && absolute.indexOf('blob:') !== 0 && absolute.indexOf('magnet:') !== 0) return;
         const key = canonicalKey(absolute);
         if (seen.has(key)) return;
         seen.add(key);
-        bridge.onMediaFound(absolute, type || 'unknown');
+        bridge.postMessage(String(type || 'unknown').slice(0, 24) + '\n' + absolute);
       } catch (_) {}
     }
 

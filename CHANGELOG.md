@@ -1,3 +1,14 @@
+# v0.8.1 — Security, resume stability and throughput
+
+- Global cleartext HTTP disabled; automatic remote analyzers require public HTTPS.
+- WebView media bridge migrated from addJavascriptInterface to origin-checked WebMessageListener.
+- HLS/NewPipe responses bounded and SSRF-resistant DNS added.
+- JitPack scoped to TeamNewPipe.
+- Release minification/R8 enabled; legacy debug-publishing upgrade workflows retired.
+- HTTP segmented pause is cooperative (no Future.cancel(true) on FileChannel writers).
+- Torrent SessionManager is process-wide to avoid JNI stop/start races.
+- YouTube HD tracks use resumable multi-range downloads when supported.
+
 # Manager Downloader v0.8.0
 
 ## Auditoría aplicada
