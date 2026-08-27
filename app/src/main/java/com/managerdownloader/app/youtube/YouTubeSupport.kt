@@ -1,6 +1,7 @@
 package com.managerdownloader.app.youtube
 
 import android.net.Uri
+import com.managerdownloader.app.security.SecurityUrlPolicy
 import java.io.IOException
 import java.util.Locale
 import java.util.concurrent.TimeUnit
@@ -136,7 +137,7 @@ object YouTubeExtractorClient {
         val safeTitle = sanitizeFileName(info.name.ifBlank { "YouTube-${info.id}" })
         val progressive = info.videoStreams
             .asSequence()
-            .filter { it.isUrl && !it.isVideoOnly && it.content.startsWith("http") }
+            .filter { it.isUrl && !it.isVideoOnly && SecurityUrlPolicy.isSafePublicHttps(it.content) }
             .map { videoOption(it, safeTitle, YouTubeFormatKind.VIDEO_WITH_AUDIO) }
             .distinctBy { it.url }
             .sortedByDescending { it.height }
@@ -144,7 +145,7 @@ object YouTubeExtractorClient {
 
         val videoOnly = info.videoOnlyStreams
             .asSequence()
-            .filter { it.isUrl && it.content.startsWith("http") }
+            .filter { it.isUrl && SecurityUrlPolicy.isSafePublicHttps(it.content) }
             .map { videoOption(it, safeTitle, YouTubeFormatKind.VIDEO_ONLY) }
             .distinctBy { it.url }
             .sortedByDescending { it.height }
@@ -152,7 +153,7 @@ object YouTubeExtractorClient {
 
         val audio = info.audioStreams
             .asSequence()
-            .filter { it.isUrl && it.content.startsWith("http") }
+            .filter { it.isUrl && SecurityUrlPolicy.isSafePublicHttps(it.content) }
             .map { audioOption(it, safeTitle) }
             .distinctBy { it.url }
             .sortedByDescending { it.bitrateKbps }
@@ -271,10 +272,11 @@ object YouTubeExtractorClient {
 
 private class OkHttpExtractorDownloader : Downloader() {
     private val client = OkHttpClient.Builder()
+        .dns(SecurityUrlPolicy.publicDns)
         .connectTimeout(20, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
         .followRedirects(true)
-        .followSslRedirects(true)
+        .followSslRedirects(false)
         .retryOnConnectionFailure(true)
         .build()
 
@@ -287,7 +289,7 @@ private class OkHttpExtractorDownloader : Downloader() {
             else -> null
         }
         val builder = okhttp3.Request.Builder()
-            .url(request.url())
+            .url(SecurityUrlPolicy.requirePublicHttps(request.url()))
             .method(method, body)
             .header("User-Agent", USER_AGENT)
 
@@ -305,7 +307,10 @@ private class OkHttpExtractorDownloader : Downloader() {
             if (response.code == 429) {
                 throw ReCaptchaException("YouTube solicitó verificación adicional", request.url())
             }
-            val responseText = response.body?.string().orEmpty()
+            val responseText = SecurityUrlPolicy.readUtf8Limited(
+                response.body,
+                SecurityUrlPolicy.MAX_EXTRACTOR_RESPONSE_BYTES
+            )
             return ExtractorResponse(
                 response.code,
                 response.message,

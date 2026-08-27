@@ -11,7 +11,12 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
-        maven { url = uri("https://jitpack.io") }
+        maven {
+            url = uri("https://jitpack.io")
+            content {
+                includeGroup("com.github.TeamNewPipe")
+            }
+        }
         maven {
             url = uri("https://dl.frostwire.com/maven")
             content {

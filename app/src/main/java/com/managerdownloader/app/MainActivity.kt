@@ -151,7 +151,7 @@ class MainActivity : ComponentActivity() {
                         incomingBrowserUrl = youtube.canonicalUrl ?: youtube.rawUrl
                     } else {
                         val sharedUrl = text?.trim()?.takeIf {
-                            it.startsWith("http://", true) || it.startsWith("https://", true)
+                            it.startsWith("https://", true)
                         }
                         if (sharedUrl != null) incomingBrowserUrl = sharedUrl
                     }
@@ -169,8 +169,9 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                     YouTubeUrlParser.parse(uri.toString()) != null -> incomingBrowserUrl = uri.toString()
-                    uri.scheme.equals("http", true) || uri.scheme.equals("https", true) ->
-                        incomingBrowserUrl = uri.toString()
+                    uri.scheme.equals("https", true) -> incomingBrowserUrl = uri.toString()
+                    uri.scheme.equals("http", true) ->
+                        Toast.makeText(this, "HTTP sin cifrar está bloqueado por seguridad", Toast.LENGTH_LONG).show()
                 }
             }
         }
@@ -186,7 +187,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun importTorrentUri(uri: Uri): Pair<String, String?>? = runCatching {
-        if (uri.scheme.equals("http", true) || uri.scheme.equals("https", true)) {
+        if (uri.scheme.equals("http", true)) return@runCatching null
+        if (uri.scheme.equals("https", true)) {
             return@runCatching uri.toString() to uri.lastPathSegment
         }
 

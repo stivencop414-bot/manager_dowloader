@@ -24,7 +24,7 @@ android {
 
         versionName = providers.gradleProperty("VERSION_NAME")
             .orNull
-            ?: "0.8.0"
+            ?: "0.8.1"
     }
 
     signingConfigs {
@@ -53,8 +53,12 @@ android {
         }
 
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
             isDebuggable = false
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
             signingConfigs.findByName("release")?.let { signingConfig = it }
         }
     }
@@ -88,6 +92,7 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.13.0")
     implementation("androidx.core:core-ktx:1.17.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.10.0")
+    implementation("androidx.webkit:webkit:1.17.0")
     implementation("androidx.documentfile:documentfile:1.1.0")
 
     implementation("androidx.compose.ui:ui")

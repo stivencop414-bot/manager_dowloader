@@ -12,8 +12,8 @@ import com.frostwire.jlibtorrent.alerts.CacheFlushedAlert
 import com.managerdownloader.app.data.DownloadRepository
 import com.managerdownloader.app.data.DownloadStatus
 import com.managerdownloader.app.data.DownloadTask
-import com.managerdownloader.app.data.StorageRepository
 import com.managerdownloader.app.data.SettingsRepository
+import com.managerdownloader.app.data.StorageRepository
 import java.io.File
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
@@ -22,31 +22,24 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import okhttp3.OkHttpClient
 import okhttp3.Request
 
-/** BitTorrent support backed by FrostWire jlibtorrent/libtorrent. */
+/**
+ * Torrent facade backed by a process-wide SessionManager. Pausing/stopping the Android service no
+ * longer destroys/recreates libtorrent while JNI/native threads are still releasing sockets.
+ */
 internal class TorrentEngine(
     private val context: Context,
     private val httpClient: OkHttpClient,
     private val baseDirectory: () -> File
 ) {
-    private val manager = SessionManager()
-    private val started = AtomicBoolean(false)
-    private val handles = ConcurrentHashMap<String, TorrentHandle>()
     private val magnetExecutor = Executors.newCachedThreadPool()
 
-    @Synchronized
     fun ensureStarted(maxActive: Int) {
-        if (started.compareAndSet(false, true)) {
-            manager.start()
-            // Download-manager behavior: don't intentionally keep finished torrents seeding.
-            manager.maxActiveSeeds(0)
-            manager.maxConnections(150)
-            manager.maxPeers(300)
-        }
-        manager.maxActiveDownloads(maxActive.coerceIn(1, 4))
-        applyDownloadRateLimit()
+        TorrentSessionHolder.ensureStarted(maxActive)
     }
 
     fun download(task: DownloadTask, control: TransferControl, maxActive: Int) {
@@ -64,40 +57,35 @@ internal class TorrentEngine(
             detail = "Buscando pares…"
         )
 
-        var handle = manager.find(info)
+        var handle = TorrentSessionHolder.find(info)
         if (handle == null) {
-            manager.download(info, saveDir)
+            TorrentSessionHolder.download(info, saveDir)
             val deadline = System.currentTimeMillis() + 15_000L
             while (handle == null && System.currentTimeMillis() < deadline && !control.stopped.get()) {
-                sleepCancelable(control, 250L)
-                if (!control.stopped.get()) {
-                    handle = manager.find(info)
-                }
+                sleepCancelable(control, 200L)
+                if (!control.stopped.get()) handle = TorrentSessionHolder.find(info)
             }
         }
 
-        // Pause/Cancel during the initial libtorrent handle resolution is a normal user action,
-        // not a failed torrent start.
         if (control.stopped.get()) return
         val torrentHandle = handle ?: throw IOException("No se pudo iniciar el torrent")
-        handles[task.id] = torrentHandle
+        TorrentSessionHolder.registerHandle(task.id, torrentHandle)
         control.torrentHandle = torrentHandle
-        torrentHandle.resume()
+        runCatching { torrentHandle.resume() }
 
         try {
             while (!control.stopped.get()) {
-                applyDownloadRateLimit()
+                TorrentSessionHolder.applyDownloadRateLimit()
 
                 val current = DownloadRepository.find(task.id) ?: return
                 if (current.status == DownloadStatus.PAUSED) {
-                    torrentHandle.pause()
+                    runCatching { torrentHandle.pause() }
                     return
                 }
 
                 if (!runCatching { torrentHandle.isValid }.getOrDefault(false)) return
                 val status = runCatching { torrentHandle.status() }.getOrNull() ?: return
-                val total = status.totalWanted().takeIf { it > 0L }
-                    ?: info.totalSize()
+                val total = status.totalWanted().takeIf { it > 0L } ?: info.totalSize()
                 val done = status.totalWantedDone().coerceAtLeast(status.totalDone())
                 val peers = status.numPeers()
                 val seeds = status.numSeeds()
@@ -116,29 +104,27 @@ internal class TorrentEngine(
                 )
 
                 if (status.isFinished()) {
-                    flushAndRemove(torrentHandle, 4_000L)
-                    handles.remove(task.id)
+                    TorrentSessionHolder.flushAndRemove(torrentHandle, 4_000L)
+                    TorrentSessionHolder.unregisterHandle(task.id)
                     control.torrentHandle = null
                     val publishedPath = StorageRepository.publishTorrentDirectory(
                         saveDir,
                         info.name(),
                         baseDirectory()
                     )
-                    DownloadRepository.markCompleted(
-                        task.id,
-                        publishedPath,
-                        total.coerceAtLeast(done)
-                    )
+                    DownloadRepository.markCompleted(task.id, publishedPath, total.coerceAtLeast(done))
                     return
                 }
 
-                sleepCancelable(control, 900L)
+                sleepCancelable(control, 800L)
             }
         } finally {
             if (control.deleteOnStop.get()) {
-                flushAndRemove(torrentHandle, 1_500L)
-                handles.remove(task.id)
+                TorrentSessionHolder.flushAndRemove(torrentHandle, 1_500L)
+                TorrentSessionHolder.unregisterHandle(task.id)
                 deleteRecursivelySafe(saveDir)
+            } else if (control.stopped.get()) {
+                runCatching { torrentHandle.pause() }
             }
         }
     }
@@ -157,35 +143,18 @@ internal class TorrentEngine(
         }
     }
 
-    private fun applyDownloadRateLimit() {
-        val desiredLimit = SettingsRepository.settings.value.bandwidthLimitBytesPerSecond
-            .coerceIn(0L, Int.MAX_VALUE.toLong())
-            .toInt()
-        runCatching {
-            if (manager.downloadRateLimit() != desiredLimit) {
-                manager.downloadRateLimit(desiredLimit)
-            }
-        }
-    }
-
-    fun pause(id: String) {
-        runCatching { handles[id]?.pause() }
-    }
-
-    fun resume(id: String) {
-        runCatching { handles[id]?.resume() }
-    }
+    fun pause(id: String) = TorrentSessionHolder.pauseHandle(id)
+    fun resume(id: String) = TorrentSessionHolder.resumeHandle(id)
 
     fun cancel(id: String) {
-        val handle = handles.remove(id)
-        if (handle != null) flushAndRemove(handle, 1_500L)
+        TorrentSessionHolder.cancelHandle(id)
         deleteRecursivelySafe(torrentDirectory(id))
     }
 
+    /** Service teardown only pauses handles. The native SessionManager remains process-wide. */
     fun stopAsync() {
-        magnetExecutor.shutdownNow()
-        if (!started.get()) return
-        Thread({ runCatching { manager.stop() } }, "torrent-session-stop").start()
+        magnetExecutor.shutdown()
+        TorrentSessionHolder.pauseAllHandles()
     }
 
     private fun loadTorrentInfo(task: DownloadTask, control: TransferControl): TorrentInfo {
@@ -198,20 +167,20 @@ internal class TorrentEngine(
                 if (control.stopped.get()) throw IOException("Transferencia detenida")
                 TorrentInfo(metadata)
             }
-
             source.startsWith("content:", ignoreCase = true) -> {
                 val bytes = context.contentResolver.openInputStream(Uri.parse(source))?.use { input ->
                     input.readBytesLimited(MAX_TORRENT_METADATA_BYTES)
                 } ?: throw IOException("No se pudo abrir el archivo .torrent")
                 TorrentInfo(bytes)
             }
-
             source.startsWith("file:", ignoreCase = true) -> {
                 val file = File(Uri.parse(source).path ?: throw IOException("Ruta .torrent inválida"))
                 TorrentInfo(file)
             }
-
             else -> {
+                if (!source.startsWith("https://", ignoreCase = true)) {
+                    throw IOException("Por seguridad, los .torrent remotos requieren HTTPS")
+                }
                 val requestBuilder = Request.Builder()
                     .url(source)
                     .header("Accept-Encoding", "identity")
@@ -237,29 +206,109 @@ internal class TorrentEngine(
 
     private fun fetchMagnetCancelable(source: String, control: TransferControl): ByteArray? {
         val future = magnetExecutor.submit<ByteArray?> {
-            manager.fetchMagnet(source, 60, context.cacheDir)
+            TorrentSessionHolder.fetchMagnet(source, 60, context.cacheDir)
         }
         try {
             while (!control.stopped.get()) {
                 try {
-                    return future.get(250L, TimeUnit.MILLISECONDS)
+                    return future.get(200L, TimeUnit.MILLISECONDS)
                 } catch (_: TimeoutException) {
-                    // Poll cancellation so Pause/Cancel never waits for fetchMagnet's full timeout.
+                    // Cooperative polling.
                 }
             }
-            future.cancel(true)
+            future.cancel(false)
             throw IOException("Transferencia detenida")
         } finally {
-            if (control.stopped.get()) future.cancel(true)
+            if (control.stopped.get()) future.cancel(false)
         }
     }
 
-    private fun flushAndRemove(handle: TorrentHandle, timeoutMs: Long) {
+    private fun torrentDirectory(id: String): File = File(File(baseDirectory(), "Torrents"), id)
+
+    private fun deleteRecursivelySafe(file: File) {
+        runCatching {
+            if (file.exists() && file.canonicalPath.startsWith(baseDirectory().canonicalPath)) {
+                file.deleteRecursively()
+            }
+        }
+    }
+
+    private fun java.io.InputStream.readBytesLimited(limit: Int): ByteArray {
+        val buffer = ByteArray(32 * 1024)
+        val output = java.io.ByteArrayOutputStream()
+        var total = 0
+        while (true) {
+            val read = read(buffer)
+            if (read == -1) break
+            total += read
+            if (total > limit) throw IOException("El archivo .torrent supera el límite de metadatos")
+            output.write(buffer, 0, read)
+        }
+        return output.toByteArray()
+    }
+
+    companion object {
+        private const val MAX_TORRENT_METADATA_BYTES = 16 * 1024 * 1024
+    }
+}
+
+/** Process-wide owner for FrostWire/libtorrent native state. */
+internal object TorrentSessionHolder {
+    private val sessionLock = ReentrantLock()
+    private val manager = SessionManager()
+    private val started = AtomicBoolean(false)
+    private val handles = ConcurrentHashMap<String, TorrentHandle>()
+
+    fun ensureStarted(maxActive: Int) = sessionLock.withLock {
+        if (started.compareAndSet(false, true)) {
+            manager.start()
+            manager.maxActiveSeeds(0)
+            manager.maxConnections(200)
+            manager.maxPeers(400)
+        }
+        manager.maxActiveDownloads(maxActive.coerceIn(1, 4))
+        applyDownloadRateLimit()
+    }
+
+    fun find(info: TorrentInfo): TorrentHandle? = runCatching { manager.find(info) }.getOrNull()
+
+    fun download(info: TorrentInfo, saveDir: File) {
+        runCatching { manager.download(info, saveDir) }
+    }
+
+    fun fetchMagnet(source: String, timeoutSeconds: Int, extraSaveDir: File): ByteArray? =
+        runCatching { manager.fetchMagnet(source, timeoutSeconds, extraSaveDir) }.getOrNull()
+
+    fun registerHandle(id: String, handle: TorrentHandle) {
+        handles[id] = handle
+    }
+
+    fun unregisterHandle(id: String) {
+        handles.remove(id)
+    }
+
+    fun pauseHandle(id: String) {
+        runCatching { handles[id]?.pause() }
+    }
+
+    fun resumeHandle(id: String) {
+        runCatching { handles[id]?.resume() }
+    }
+
+    fun cancelHandle(id: String) {
+        val handle = handles.remove(id)
+        if (handle != null) flushAndRemove(handle, 1_500L)
+    }
+
+    fun pauseAllHandles() {
+        handles.values.forEach { runCatching { it.pause() } }
+    }
+
+    fun flushAndRemove(handle: TorrentHandle, timeoutMs: Long) {
         val infoHash = runCatching { handle.infoHash().toString() }.getOrNull()
         val flushed = CountDownLatch(1)
         val listener = object : AlertListener {
             override fun types(): IntArray = intArrayOf(AlertType.CACHE_FLUSHED.swig())
-
             override fun alert(alert: Alert<*>) {
                 val cacheAlert = alert as? CacheFlushedAlert ?: return
                 val matches = infoHash == null || runCatching {
@@ -280,32 +329,12 @@ internal class TorrentEngine(
         }
     }
 
-    private fun torrentDirectory(id: String): File =
-        File(File(baseDirectory(), "Torrents"), id)
-
-    private fun deleteRecursivelySafe(file: File) {
+    fun applyDownloadRateLimit() {
+        val desiredLimit = SettingsRepository.settings.value.bandwidthLimitBytesPerSecond
+            .coerceIn(0L, Int.MAX_VALUE.toLong())
+            .toInt()
         runCatching {
-            if (file.exists() && file.canonicalPath.startsWith(baseDirectory().canonicalPath)) {
-                file.deleteRecursively()
-            }
+            if (manager.downloadRateLimit() != desiredLimit) manager.downloadRateLimit(desiredLimit)
         }
-    }
-
-    private fun java.io.InputStream.readBytesLimited(limit: Int): ByteArray {
-        val buffer = ByteArray(16 * 1024)
-        val output = java.io.ByteArrayOutputStream()
-        var total = 0
-        while (true) {
-            val read = read(buffer)
-            if (read == -1) break
-            total += read
-            if (total > limit) throw IOException("El archivo .torrent supera el límite de metadatos")
-            output.write(buffer, 0, read)
-        }
-        return output.toByteArray()
-    }
-
-    companion object {
-        private const val MAX_TORRENT_METADATA_BYTES = 16 * 1024 * 1024
     }
 }

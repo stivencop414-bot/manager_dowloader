@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -16,6 +17,7 @@ import android.os.IBinder
 import android.system.Os
 import android.webkit.URLUtil
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.frostwire.jlibtorrent.TorrentHandle
 import com.managerdownloader.app.MainActivity
@@ -27,6 +29,7 @@ import com.managerdownloader.app.data.QueueMode
 import com.managerdownloader.app.data.SettingsRepository
 import com.managerdownloader.app.data.StorageRepository
 import com.managerdownloader.app.media.NativeMediaMuxerEngine
+import com.managerdownloader.app.security.SecurityUrlPolicy
 import com.managerdownloader.app.youtube.YouTubeExtractorClient
 import java.io.BufferedInputStream
 import java.io.File
@@ -42,6 +45,7 @@ import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicLongArray
 import java.util.concurrent.atomic.AtomicReference
@@ -137,6 +141,7 @@ class DownloadService : Service() {
     private val schedulerLock = Any()
     private val active = ConcurrentHashMap<String, TransferControl>()
     private val shuttingDown = AtomicBoolean(false)
+    private val latestStartId = AtomicInteger(0)
     private val bandwidthLimiter = SharedBandwidthLimiter {
         SettingsRepository.settings.value.bandwidthLimitBytesPerSecond
     }
@@ -157,15 +162,16 @@ class DownloadService : Service() {
     }
 
     private val httpDispatcher = Dispatcher().apply {
-        maxRequests = 32
-        maxRequestsPerHost = 8
+        maxRequests = 48
+        maxRequestsPerHost = 16
     }
 
     private val client = OkHttpClient.Builder()
         .dispatcher(httpDispatcher)
-        .connectionPool(ConnectionPool(12, 5, java.util.concurrent.TimeUnit.MINUTES))
+        .dns(SecurityUrlPolicy.publicDns)
+        .connectionPool(ConnectionPool(24, 5, java.util.concurrent.TimeUnit.MINUTES))
         .followRedirects(true)
-        .followSslRedirects(true)
+        .followSslRedirects(false)
         .retryOnConnectionFailure(true)
         .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
         .readTimeout(5, java.util.concurrent.TimeUnit.MINUTES)
@@ -188,6 +194,7 @@ class DownloadService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        latestStartId.set(startId)
         ensureForeground("Preparando transferencias…")
 
         when (intent?.action) {
@@ -212,7 +219,6 @@ class DownloadService : Service() {
 
     private fun resumeInternal(id: String) {
         DownloadRepository.resume(id)
-        torrentEngine.resume(id)
     }
 
     private fun cancelInternal(id: String) {
@@ -326,8 +332,10 @@ class DownloadService : Service() {
 
             if (active.isEmpty() && !DownloadRepository.hasQueued()) {
                 safePowerManager.release()
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
+                val stopId = latestStartId.get()
+                if (stopSelfResult(stopId)) {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                }
             }
         }
     }
@@ -509,11 +517,11 @@ class DownloadService : Service() {
 
         DownloadRepository.updateMetadata(task.id, filename = task.filename, detail = "YouTube HD · descargando video")
         try {
-            downloadStagingStream(task, task.url, videoPart, control, "Video HD")
+            downloadYouTubeTrackFast(task, task.url, videoPart, control, "Video HD", "video", task.sourceFormatId ?: "video")
         } catch (error: HttpStatusException) {
             if (error.statusCode != 403 || control.stopped.get()) throw error
             task = refreshMuxedTask(task) ?: throw error
-            downloadStagingStream(task, task.url, videoPart, control, "Video HD")
+            downloadYouTubeTrackFast(task, task.url, videoPart, control, "Video HD", "video", task.sourceFormatId ?: "video")
         }
         if (control.stopped.get()) return
 
@@ -521,11 +529,11 @@ class DownloadService : Service() {
         val audioUrl = task.secondaryUrl?.takeIf { it.isNotBlank() } ?: audioUrlInitial
         DownloadRepository.updateMetadata(task.id, detail = "YouTube HD · descargando audio")
         try {
-            downloadStagingStream(task, audioUrl, audioPart, control, "Audio")
+            downloadYouTubeTrackFast(task, audioUrl, audioPart, control, "Audio", "audio", task.secondarySourceFormatId ?: "audio")
         } catch (error: HttpStatusException) {
             if (error.statusCode != 403 || control.stopped.get()) throw error
             task = refreshMuxedTask(task) ?: throw error
-            downloadStagingStream(task, task.secondaryUrl ?: audioUrl, audioPart, control, "Audio")
+            downloadYouTubeTrackFast(task, task.secondaryUrl ?: audioUrl, audioPart, control, "Audio", "audio", task.secondarySourceFormatId ?: "audio")
         }
         if (control.stopped.get()) return
 
@@ -558,8 +566,57 @@ class DownloadService : Service() {
         val publishedPath = StorageRepository.publishFile(muxPart, finalName, downloadsDirectory())
         runCatching { videoPart.delete() }
         runCatching { audioPart.delete() }
+        runCatching { youtubeTrackMetaFile(task.id, "video").delete() }
+        runCatching { youtubeTrackMetaFile(task.id, "audio").delete() }
         DownloadRepository.markCompleted(task.id, publishedPath, completedBytes)
         showCompletedNotification(finalName)
+    }
+
+    private fun downloadYouTubeTrackFast(
+        task: DownloadTask,
+        url: String,
+        target: File,
+        control: TransferControl,
+        label: String,
+        trackName: String,
+        stableId: String
+    ) {
+        val metaFile = youtubeTrackMetaFile(task.id, trackName)
+        val settings = SettingsRepository.settings.value
+        val requested = if (settings.turboMode) maxOf(6, settings.segmentsPerFile) else settings.segmentsPerFile
+        val segmented = try {
+            YouTubeMultiRangeDownloader.downloadIfSupported(
+                client = client,
+                task = task,
+                url = url,
+                target = target,
+                metaFile = metaFile,
+                stableId = stableId,
+                control = control,
+                requestedSegments = requested,
+                throttle = { bytes -> bandwidthLimiter.acquire(bytes) },
+                networkAllowed = { ensureNetworkPolicy(task.id, control) },
+                onProgress = { downloaded, total, speed, connections ->
+                    DownloadRepository.updateProgress(
+                        task.id,
+                        downloaded,
+                        total,
+                        speed,
+                        "$label · $connections conexiones"
+                    )
+                    updateAggregateNotificationThrottled()
+                }
+            )
+        } catch (error: YouTubeTrackHttpException) {
+            throw HttpStatusException(error.statusCode, error.message ?: "HTTP ${error.statusCode} al descargar $label")
+        }
+        if (!segmented && !control.stopped.get()) {
+            if (metaFile.exists()) {
+                runCatching { metaFile.delete() }
+                runCatching { target.delete() }
+            }
+            downloadStagingStream(task, url, target, control, label)
+        }
     }
 
     private fun downloadStagingStream(
@@ -571,7 +628,7 @@ class DownloadService : Service() {
     ) {
         target.parentFile?.mkdirs()
         var existing = target.length().coerceAtLeast(0L)
-        val builder = Request.Builder().url(url).header("Accept-Encoding", "identity").get()
+        val builder = Request.Builder().url(SecurityUrlPolicy.requirePublicHttps(url)).header("Accept-Encoding", "identity").get()
         task.cookie?.takeIf { it.isNotBlank() }?.let { builder.header("Cookie", it) }
         task.userAgent?.takeIf { it.isNotBlank() }?.let { builder.header("User-Agent", it) }
         task.referer?.takeIf { it.isNotBlank() }?.let { builder.header("Referer", it) }
@@ -668,7 +725,7 @@ class DownloadService : Service() {
             val parsedRange = parseContentRange(response.header("Content-Range"))
             val rangeTotal = parsedRange?.total
             val supportsRanges = response.code == 206 &&
-                parsedRange?.start == 0L && parsedRange.end == 0L &&
+                parsedRange?.start == 0L && parsedRange.end >= 0L &&
                 rangeTotal != null && rangeTotal > 1L
             val contentLength = response.body?.contentLength() ?: -1L
             val total = when {
@@ -765,9 +822,10 @@ class DownloadService : Service() {
             segmentExecutor.submit {
                 var permitAcquired = false
                 try {
-                    segmentPermits.acquire()
-                    permitAcquired = true
-                    if (control.stopped.get()) return@submit
+                    while (!control.stopped.get() && !permitAcquired) {
+                        permitAcquired = segmentPermits.tryAcquire(200L, TimeUnit.MILLISECONDS)
+                    }
+                    if (!permitAcquired || control.stopped.get()) return@submit
 
                     val maxRetries = SettingsRepository.settings.value.segmentRetryCount
                     var attempt = 0
@@ -824,7 +882,8 @@ class DownloadService : Service() {
             futures.forEach { future ->
                 while (!future.isDone) {
                     if (control.stopped.get()) {
-                        futures.forEach { it.cancel(true) }
+                        control.calls.forEach { it.cancel() }
+                        awaitHttpWorkers(futures)
                         persistSegmentProgress(task, totalBytes, segmentCount, validator, progress)
                         return
                     }
@@ -840,7 +899,10 @@ class DownloadService : Service() {
                 }
             }
         } finally {
-            if (control.stopped.get()) futures.forEach { it.cancel(true) }
+            if (control.stopped.get()) {
+                control.calls.forEach { it.cancel() }
+                awaitHttpWorkers(futures)
+            }
         }
 
         if (control.stopped.get()) {
@@ -877,6 +939,25 @@ class DownloadService : Service() {
         )
         DownloadRepository.markCompleted(task.id, publishedPath, completedBytes)
         showCompletedNotification(task.filename)
+    }
+
+    private fun awaitHttpWorkers(futures: List<java.util.concurrent.Future<*>>) {
+        futures.forEach { future ->
+            while (!future.isDone) {
+                try {
+                    future.get(200L, TimeUnit.MILLISECONDS)
+                } catch (_: java.util.concurrent.TimeoutException) {
+                    // Cancelled OkHttp calls unblock I/O; never interrupt a FileChannel writer.
+                } catch (_: java.util.concurrent.CancellationException) {
+                    break
+                } catch (_: java.util.concurrent.ExecutionException) {
+                    break
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return
+                }
+            }
+        }
     }
 
     private data class ByteSegment(val start: Long, val end: Long) {
@@ -942,8 +1023,8 @@ class DownloadService : Service() {
 
                 val contentRange = parseContentRange(response.header("Content-Range"))
                     ?: throw IOException("Content-Range ausente o inválido")
-                if (contentRange.start != requestStart || contentRange.end > segment.end) {
-                    throw IOException("Content-Range no coincide con el bloque solicitado")
+                if (contentRange.start != requestStart || contentRange.end < requestStart) {
+                    throw IOException("Content-Range no coincide con el inicio del bloque solicitado")
                 }
                 if (contentRange.total != null && contentRange.total != totalBytes) {
                     throw IOException("El tamaño remoto cambió durante la descarga")
@@ -965,18 +1046,20 @@ class DownloadService : Service() {
                             if (!ensureNetworkPolicy(task.id, control)) break
 
                             val before = progress.get(index)
-                            if (before + read > segment.length) {
-                                throw IOException("El servidor envió más bytes de los solicitados")
-                            }
+                            val remaining = (segment.length - before).coerceAtLeast(0L)
+                            if (remaining <= 0L) break
+                            val accepted = minOf(read.toLong(), remaining).toInt()
 
-                            bandwidthLimiter.acquire(read)
+                            bandwidthLimiter.acquire(accepted)
                             buffer.flip()
+                            if (accepted < read) buffer.limit(accepted)
                             while (buffer.hasRemaining()) {
                                 val written = fileChannel.write(buffer, writePosition)
                                 if (written <= 0) throw IOException("No se pudo escribir el bloque en disco")
                                 writePosition += written.toLong()
                             }
-                            progress.addAndGet(index, read.toLong())
+                            progress.addAndGet(index, accepted.toLong())
+                            if (accepted < read || progress.get(index) >= segment.length) break
 
                             val now = System.currentTimeMillis()
                             if (now - lastUpdate.get() >= 500L) {
@@ -1169,7 +1252,7 @@ class DownloadService : Service() {
     }
 
     private fun requestBuilder(task: DownloadTask): Request.Builder {
-        val builder = Request.Builder().url(task.url)
+        val builder = Request.Builder().url(SecurityUrlPolicy.requirePublicHttps(task.url))
         task.cookie?.takeIf { it.isNotBlank() }?.let { builder.header("Cookie", it) }
         task.userAgent?.takeIf { it.isNotBlank() }?.let { builder.header("User-Agent", it) }
         task.referer?.takeIf { it.isNotBlank() }?.let { builder.header("Referer", it) }
@@ -1402,11 +1485,14 @@ class DownloadService : Service() {
     private fun youtubeVideoFile(id: String): File = File(downloadsDirectory(), ".$id.yt-video.part")
     private fun youtubeAudioFile(id: String): File = File(downloadsDirectory(), ".$id.yt-audio.part")
     private fun youtubeMuxFile(id: String, container: String): File = File(downloadsDirectory(), ".$id.muxing.$container")
+    private fun youtubeTrackMetaFile(id: String, track: String): File = File(downloadsDirectory(), ".$id.$track.ytsegments")
 
     private fun cleanupHttpParts(id: String) {
         runCatching { partialFile(id).delete() }
         runCatching { youtubeVideoFile(id).delete() }
         runCatching { youtubeAudioFile(id).delete() }
+        runCatching { youtubeTrackMetaFile(id, "video").delete() }
+        runCatching { youtubeTrackMetaFile(id, "audio").delete() }
         downloadsDirectory().listFiles()?.filter { it.name.startsWith(".$id.muxing.") }?.forEach { runCatching { it.delete() } }
         runCatching { singleMetaFile(id).delete() }
         cleanupSegmentedState(id, deletePart = false)
@@ -1429,7 +1515,17 @@ class DownloadService : Service() {
     }
 
     private fun ensureForeground(text: String) {
-        startForeground(NOTIFICATION_ID, buildNotification("Manager Downloader", text, -1))
+        val notification = buildNotification("Manager Downloader", text, -1)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ServiceCompat.startForeground(
+                this,
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
     }
 
     private fun updateAggregateNotification() {
@@ -1479,13 +1575,15 @@ class DownloadService : Service() {
         return builder.build()
     }
 
-    private fun serviceActionIntent(action: String, requestCode: Int): PendingIntent =
-        PendingIntent.getService(
-            this,
-            requestCode,
-            Intent(this, DownloadService::class.java).setAction(action),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
+    private fun serviceActionIntent(action: String, requestCode: Int): PendingIntent {
+        val intent = Intent(this, DownloadService::class.java).setAction(action)
+        val flags = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            PendingIntent.getForegroundService(this, requestCode, intent, flags)
+        } else {
+            PendingIntent.getService(this, requestCode, intent, flags)
+        }
+    }
 
     private fun contentIntent(): PendingIntent = PendingIntent.getActivity(
         this,
@@ -1522,8 +1620,8 @@ class DownloadService : Service() {
         if (::safePowerManager.isInitialized) safePowerManager.release()
         torrentEngine.stopAsync()
         runCatching { connectivityManager.unregisterNetworkCallback(networkCallback) }
-        transferExecutor.shutdownNow()
-        segmentExecutor.shutdownNow()
+        transferExecutor.shutdown()
+        segmentExecutor.shutdown()
         DownloadRepository.flush()
         super.onDestroy()
     }
