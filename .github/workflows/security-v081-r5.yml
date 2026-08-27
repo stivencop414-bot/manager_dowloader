@@ -1,0 +1,1068 @@
+name: Security + Stability Upgrade v0.8.1 R5
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: manager-downloader-security-v081
+  cancel-in-progress: false
+
+jobs:
+  harden-build-pr:
+    runs-on: ubuntu-latest
+    env:
+      BUNDLE: manager_downloader_v081_security_upgrade_r5.zip
+      BUNDLE_SHA256: 2d8468ee93d52982df40e679aeab66552bf9b319f2cbc1443e6bc920b25f8dc1
+      CANDIDATE_BRANCH: security-v0.8.1-r5-${{ github.run_number }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Verify v0.8.0 base and security bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$BUNDLE" || { echo "ERROR: falta $BUNDLE en la raíz"; exit 1; }
+          echo "$BUNDLE_SHA256  $BUNDLE" | sha256sum -c -
+
+          # Pin the exact v0.8.0 source files R5 was reviewed against. Uploading new bundle/workflow
+          # files may move main, but these source blobs must stay byte-for-byte identical.
+          check_blob() {
+            local file="$1" expected="$2"
+            local actual
+            actual="$(git hash-object "$file")"
+            if [ "$actual" != "$expected" ]; then
+              echo "ERROR: fuente base cambió: $file"
+              echo "esperado=$expected actual=$actual"
+              exit 1
+            fi
+          }
+          check_blob app/build.gradle.kts b934e774a794c09975492145958ef56e5ada21fc
+          check_blob settings.gradle.kts e8045e9594d05d8937c85dbfdf83fb09d68584a8
+          check_blob app/src/main/AndroidManifest.xml 1b4e87ae15e607b8f2fb9bd2f74043912385b2ca
+          check_blob app/src/main/res/xml/network_security_config.xml 2439f15c2cb7d1046af45236a2fe03358d2153ca
+          check_blob app/src/main/java/com/managerdownloader/app/MainActivity.kt ed0d4e6b1584a278fcd3494dc7d124babc7247f3
+          check_blob app/src/main/java/com/managerdownloader/app/youtube/YouTubeSupport.kt 5f4be8abf6140ceed4081ce387203f128f52e8a1
+          check_blob app/src/main/java/com/managerdownloader/app/download/DownloadService.kt b8441dea0a32fe38883df04fab04ea40adbee26f
+          check_blob app/src/main/java/com/managerdownloader/app/download/TorrentEngine.kt 8b8fbfc89a284fed8f54d04f2e99207828c0b87c
+          check_blob app/src/main/java/com/managerdownloader/app/ui/BrowserScreen.kt 0fac81766dcf02b8be5012a36bbc1c0e6a245d8c
+          check_blob app/src/main/java/com/managerdownloader/app/ui/DownloadsScreen.kt 25d7abb2b3b0f9ab9b4debae8b3176b828b46109
+
+          grep -Fq '?: "0.8.0"' app/build.gradle.kts || {
+            echo "ERROR: esta actualización requiere la base v0.8.0 actual."
+            exit 1
+          }
+          grep -Fq 'YOUTUBE_MUXED' app/src/main/java/com/managerdownloader/app/data/DownloadModels.kt
+          grep -Fq 'archivo único reanudable' app/src/main/java/com/managerdownloader/app/download/DownloadService.kt
+          grep -Fq 'addJavascriptInterface' app/src/main/java/com/managerdownloader/app/ui/BrowserScreen.kt
+
+          rm -rf /tmp/v081-security
+          mkdir -p /tmp/v081-security
+          unzip -q "$BUNDLE" -d /tmp/v081-security
+
+          # Bundle source-only: never execute code hidden inside the ZIP.
+          if unzip -Z1 "$BUNDLE" | grep -E '\.(py|sh|bash|js|ps1|exe|bat)$' >/dev/null; then
+            echo "ERROR: el bundle contiene un script/ejecutable. No se ejecutará."
+            exit 1
+          fi
+          test -f /tmp/v081-security/payload/app/src/main/java/com/managerdownloader/app/security/SecurityUrlPolicy.kt
+          test -f /tmp/v081-security/payload/app/src/main/java/com/managerdownloader/app/download/TorrentEngine.kt
+          test -f /tmp/v081-security/payload/app/src/main/java/com/managerdownloader/app/download/YouTubeMultiRangeDownloader.kt
+          test -f /tmp/v081-security/payload/app/src/main/java/com/managerdownloader/app/hls/HlsManifestParser.kt
+
+      - name: Create isolated candidate branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git switch -c "$CANDIDATE_BRANCH"
+
+      - name: Copy reviewed source payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p app/src/main/java/com/managerdownloader/app/security
+          cp /tmp/v081-security/payload/app/src/main/java/com/managerdownloader/app/security/SecurityUrlPolicy.kt app/src/main/java/com/managerdownloader/app/security/SecurityUrlPolicy.kt
+          cp /tmp/v081-security/payload/app/src/main/java/com/managerdownloader/app/download/TorrentEngine.kt app/src/main/java/com/managerdownloader/app/download/TorrentEngine.kt
+          cp /tmp/v081-security/payload/app/src/main/java/com/managerdownloader/app/download/YouTubeMultiRangeDownloader.kt app/src/main/java/com/managerdownloader/app/download/YouTubeMultiRangeDownloader.kt
+          cp /tmp/v081-security/payload/app/src/main/java/com/managerdownloader/app/hls/HlsManifestParser.kt app/src/main/java/com/managerdownloader/app/hls/HlsManifestParser.kt
+          cp /tmp/v081-security/payload/app/proguard-rules.pro app/proguard-rules.pro
+
+      - name: Apply visible v0.8.1 source patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import textwrap
+
+
+          def read(path):
+              return Path(path).read_text(encoding="utf-8")
+
+
+          def write(path, value):
+              Path(path).write_text(value, encoding="utf-8")
+
+
+          def replace_exact(path, old, new, expected=1):
+              data = read(path)
+              count = data.count(old)
+              if count == expected:
+                  write(path, data.replace(old, new))
+                  return
+              # R5 is safe to re-run against an already transformed local tree during diagnostics.
+              if old not in data and data.count(new) >= expected:
+                  return
+              raise SystemExit(f"PATCH ERROR {path}: expected {expected}, found {count}: {old[:100]!r}")
+
+
+          def regex_once(path, pattern, replacement):
+              data = read(path)
+              next_data, count = re.subn(pattern, lambda _match: replacement, data, count=1, flags=re.S)
+              if count != 1:
+                  raise SystemExit(f"PATCH ERROR {path}: regex not found/unique: {pattern[:100]!r}")
+              write(path, next_data)
+
+
+          def block(value, indent=0):
+              clean = textwrap.dedent(value).strip("\n")
+              return textwrap.indent(clean, " " * indent)
+
+
+          # ---------------- TLS / build / repositories ----------------
+          replace_exact(
+              "app/src/main/AndroidManifest.xml",
+              'android:usesCleartextTraffic="true"',
+              'android:usesCleartextTraffic="false"',
+          )
+          replace_exact(
+              "app/src/main/res/xml/network_security_config.xml",
+              'cleartextTrafficPermitted="true"',
+              'cleartextTrafficPermitted="false"',
+          )
+          replace_exact("app/build.gradle.kts", '?: "0.8.0"', '?: "0.8.1"')
+          replace_exact("app/build.gradle.kts", "            isMinifyEnabled = false", "            isMinifyEnabled = true")
+          replace_exact(
+              "app/build.gradle.kts",
+              "            isDebuggable = false\n",
+              "            isDebuggable = false\n"
+              "            proguardFiles(\n"
+              "                getDefaultProguardFile(\"proguard-android-optimize.txt\"),\n"
+              "                \"proguard-rules.pro\"\n"
+              "            )\n",
+          )
+          replace_exact(
+              "app/build.gradle.kts",
+              '    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.10.0")\n',
+              '    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.10.0")\n'
+              '    implementation("androidx.webkit:webkit:1.17.0")\n',
+          )
+          replace_exact(
+              "settings.gradle.kts",
+              '        maven { url = uri("https://jitpack.io") }',
+              block(
+                  '''
+                  maven {
+                      url = uri("https://jitpack.io")
+                      content {
+                          includeGroup("com.github.TeamNewPipe")
+                      }
+                  }
+                  ''',
+                  8,
+              ),
+          )
+
+          # ---------------- MainActivity external intents ----------------
+          replace_exact(
+              "app/src/main/java/com/managerdownloader/app/MainActivity.kt",
+              'it.startsWith("http://", true) || it.startsWith("https://", true)',
+              'it.startsWith("https://", true)',
+          )
+          replace_exact(
+              "app/src/main/java/com/managerdownloader/app/MainActivity.kt",
+              '                    uri.scheme.equals("http", true) || uri.scheme.equals("https", true) ->\n'
+              '                        incomingBrowserUrl = uri.toString()',
+              '                    uri.scheme.equals("https", true) -> incomingBrowserUrl = uri.toString()\n'
+              '                    uri.scheme.equals("http", true) ->\n'
+              '                        Toast.makeText(this, "HTTP sin cifrar está bloqueado por seguridad", Toast.LENGTH_LONG).show()',
+          )
+          replace_exact(
+              "app/src/main/java/com/managerdownloader/app/MainActivity.kt",
+              '        if (uri.scheme.equals("http", true) || uri.scheme.equals("https", true)) {\n'
+              '            return@runCatching uri.toString() to uri.lastPathSegment\n'
+              '        }',
+              '        if (uri.scheme.equals("http", true)) return@runCatching null\n'
+              '        if (uri.scheme.equals("https", true)) {\n'
+              '            return@runCatching uri.toString() to uri.lastPathSegment\n'
+              '        }',
+          )
+
+          # ---------------- NewPipe / remote response limits / SSRF ----------------
+          youtube = "app/src/main/java/com/managerdownloader/app/youtube/YouTubeSupport.kt"
+          replace_exact(youtube, "import android.net.Uri\n", "import android.net.Uri\nimport com.managerdownloader.app.security.SecurityUrlPolicy\n")
+          replace_exact(
+              youtube,
+              '.filter { it.isUrl && !it.isVideoOnly && it.content.startsWith("http") }',
+              '.filter { it.isUrl && !it.isVideoOnly && SecurityUrlPolicy.isSafePublicHttps(it.content) }',
+          )
+          replace_exact(
+              youtube,
+              '.filter { it.isUrl && it.content.startsWith("http") }',
+              '.filter { it.isUrl && SecurityUrlPolicy.isSafePublicHttps(it.content) }',
+              expected=2,
+          )
+          replace_exact(
+              youtube,
+              "    private val client = OkHttpClient.Builder()\n        .connectTimeout(20, TimeUnit.SECONDS)",
+              "    private val client = OkHttpClient.Builder()\n        .dns(SecurityUrlPolicy.publicDns)\n        .connectTimeout(20, TimeUnit.SECONDS)",
+          )
+          replace_exact(youtube, "        .followSslRedirects(true)", "        .followSslRedirects(false)")
+          replace_exact(
+              youtube,
+              "            .url(request.url())",
+              "            .url(SecurityUrlPolicy.requirePublicHttps(request.url()))",
+          )
+          replace_exact(
+              youtube,
+              "            val responseText = response.body?.string().orEmpty()",
+              "            val responseText = SecurityUrlPolicy.readUtf8Limited(\n"
+              "                response.body,\n"
+              "                SecurityUrlPolicy.MAX_EXTRACTOR_RESPONSE_BYTES\n"
+              "            )",
+          )
+
+          # ---------------- DownloadService resume + speed + network hardening ----------------
+          service = "app/src/main/java/com/managerdownloader/app/download/DownloadService.kt"
+          replace_exact(service, "import android.content.Intent\n", "import android.content.Intent\nimport android.content.pm.ServiceInfo\n")
+          replace_exact(service, "import androidx.core.app.NotificationCompat\n", "import androidx.core.app.NotificationCompat\nimport androidx.core.app.ServiceCompat\n")
+          replace_exact(service, "import com.managerdownloader.app.media.NativeMediaMuxerEngine\n", "import com.managerdownloader.app.media.NativeMediaMuxerEngine\nimport com.managerdownloader.app.security.SecurityUrlPolicy\n")
+          replace_exact(service, "import java.util.concurrent.atomic.AtomicBoolean\n", "import java.util.concurrent.atomic.AtomicBoolean\nimport java.util.concurrent.atomic.AtomicInteger\n")
+          replace_exact(
+              service,
+              "    private val shuttingDown = AtomicBoolean(false)\n",
+              "    private val shuttingDown = AtomicBoolean(false)\n    private val latestStartId = AtomicInteger(0)\n",
+          )
+          replace_exact(service, "        maxRequests = 32", "        maxRequests = 48")
+          replace_exact(service, "        maxRequestsPerHost = 8", "        maxRequestsPerHost = 16")
+          replace_exact(
+              service,
+              "        .dispatcher(httpDispatcher)\n        .connectionPool(ConnectionPool(12, 5, java.util.concurrent.TimeUnit.MINUTES))",
+              "        .dispatcher(httpDispatcher)\n        .dns(SecurityUrlPolicy.publicDns)\n        .connectionPool(ConnectionPool(24, 5, java.util.concurrent.TimeUnit.MINUTES))",
+          )
+          replace_exact(service, "        .followSslRedirects(true)", "        .followSslRedirects(false)")
+          replace_exact(
+              service,
+              "    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {\n",
+              "    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {\n        latestStartId.set(startId)\n",
+          )
+          replace_exact(
+              service,
+              "            if (active.isEmpty() && !DownloadRepository.hasQueued()) {\n"
+              "                safePowerManager.release()\n"
+              "                stopForeground(STOP_FOREGROUND_REMOVE)\n"
+              "                stopSelf()\n"
+              "            }",
+              "            if (active.isEmpty() && !DownloadRepository.hasQueued()) {\n"
+              "                safePowerManager.release()\n"
+              "                val stopId = latestStartId.get()\n"
+              "                if (stopSelfResult(stopId)) {\n"
+              "                    stopForeground(STOP_FOREGROUND_REMOVE)\n"
+              "                }\n"
+              "            }",
+          )
+          replace_exact(
+              service,
+              "                parsedRange?.start == 0L && parsedRange.end == 0L &&",
+              "                parsedRange?.start == 0L && parsedRange.end >= 0L &&",
+          )
+          # Tolerate standards-compatible CDNs that return a wider range than requested.
+          # We only persist bytes that belong to the current segment, then close the response.
+          replace_exact(
+              service,
+              '                if (contentRange.start != requestStart || contentRange.end > segment.end) {\n'
+              '                    throw IOException("Content-Range no coincide con el bloque solicitado")\n'
+              '                }',
+              '                if (contentRange.start != requestStart || contentRange.end < requestStart) {\n'
+              '                    throw IOException("Content-Range no coincide con el inicio del bloque solicitado")\n'
+              '                }',
+          )
+          replace_exact(
+              service,
+              '                            val before = progress.get(index)\n'
+              '                            if (before + read > segment.length) {\n'
+              '                                throw IOException("El servidor envió más bytes de los solicitados")\n'
+              '                            }\n\n'
+              '                            bandwidthLimiter.acquire(read)\n'
+              '                            buffer.flip()\n'
+              '                            while (buffer.hasRemaining()) {\n'
+              '                                val written = fileChannel.write(buffer, writePosition)\n'
+              '                                if (written <= 0) throw IOException("No se pudo escribir el bloque en disco")\n'
+              '                                writePosition += written.toLong()\n'
+              '                            }\n'
+              '                            progress.addAndGet(index, read.toLong())',
+              '                            val before = progress.get(index)\n'
+              '                            val remaining = (segment.length - before).coerceAtLeast(0L)\n'
+              '                            if (remaining <= 0L) break\n'
+              '                            val accepted = minOf(read.toLong(), remaining).toInt()\n\n'
+              '                            bandwidthLimiter.acquire(accepted)\n'
+              '                            buffer.flip()\n'
+              '                            if (accepted < read) buffer.limit(accepted)\n'
+              '                            while (buffer.hasRemaining()) {\n'
+              '                                val written = fileChannel.write(buffer, writePosition)\n'
+              '                                if (written <= 0) throw IOException("No se pudo escribir el bloque en disco")\n'
+              '                                writePosition += written.toLong()\n'
+              '                            }\n'
+              '                            progress.addAndGet(index, accepted.toLong())\n'
+              '                            if (accepted < read || progress.get(index) >= segment.length) break',
+          )
+          # A paused task must not remain blocked waiting for a global segment permit.
+          replace_exact(
+              service,
+              '                try {\n'
+              '                    segmentPermits.acquire()\n'
+              '                    permitAcquired = true\n'
+              '                    if (control.stopped.get()) return@submit',
+              '                try {\n'
+              '                    while (!control.stopped.get() && !permitAcquired) {\n'
+              '                        permitAcquired = segmentPermits.tryAcquire(200L, TimeUnit.MILLISECONDS)\n'
+              '                    }\n'
+              '                    if (!permitAcquired || control.stopped.get()) return@submit',
+          )
+          # Queue state owns resumption. Do not wake a native torrent handle before it has a slot.
+          replace_exact(
+              service,
+              '    private fun resumeInternal(id: String) {\n'
+              '        DownloadRepository.resume(id)\n'
+              '        torrentEngine.resume(id)\n'
+              '    }',
+              '    private fun resumeInternal(id: String) {\n'
+              '        DownloadRepository.resume(id)\n'
+              '    }',
+          )
+
+          # Cooperative HTTP pause: cancel OkHttp Calls, never interrupt NIO/FileChannel workers.
+          data = read(service)
+          pause_pattern = (
+              r'(?P<i>[ \t]+)if \(control\.stopped\.get\(\)\) \{\n'
+              r'(?P=i)    futures\.forEach \{ it\.cancel\(true\) \}\n'
+              r'(?P=i)    persistSegmentProgress\(task, totalBytes, segmentCount, validator, progress\)\n'
+              r'(?P=i)    return\n'
+              r'(?P=i)\}'
+          )
+          match = re.search(pause_pattern, data)
+          if not match:
+              raise SystemExit("PATCH ERROR DownloadService: cooperative pause block not found")
+          indent = match.group("i")
+          pause_replacement = (
+              indent + "if (control.stopped.get()) {\n" +
+              indent + "    control.calls.forEach { it.cancel() }\n" +
+              indent + "    awaitHttpWorkers(futures)\n" +
+              indent + "    persistSegmentProgress(task, totalBytes, segmentCount, validator, progress)\n" +
+              indent + "    return\n" +
+              indent + "}"
+          )
+          write(service, data[:match.start()] + pause_replacement + data[match.end():])
+          replace_exact(
+              service,
+              "            if (control.stopped.get()) futures.forEach { it.cancel(true) }",
+              "            if (control.stopped.get()) {\n"
+              "                control.calls.forEach { it.cancel() }\n"
+              "                awaitHttpWorkers(futures)\n"
+              "            }",
+          )
+          await_http = block(
+              '''
+              private fun awaitHttpWorkers(futures: List<java.util.concurrent.Future<*>>) {
+                  futures.forEach { future ->
+                      while (!future.isDone) {
+                          try {
+                              future.get(200L, TimeUnit.MILLISECONDS)
+                          } catch (_: java.util.concurrent.TimeoutException) {
+                              // Cancelled OkHttp calls unblock I/O; never interrupt a FileChannel writer.
+                          } catch (_: java.util.concurrent.CancellationException) {
+                              break
+                          } catch (_: java.util.concurrent.ExecutionException) {
+                              break
+                          } catch (_: InterruptedException) {
+                              Thread.currentThread().interrupt()
+                              return
+                          }
+                      }
+                  }
+              }
+              ''',
+              4,
+          )
+          replace_exact(service, "    private data class ByteSegment(val start: Long, val end: Long) {", await_http + "\n\n    private data class ByteSegment(val start: Long, val end: Long) {")
+
+          # YouTube HD: resumable 4-6 multi-range connections when supported.
+          replace_exact(
+              service,
+              'downloadStagingStream(task, task.url, videoPart, control, "Video HD")',
+              'downloadYouTubeTrackFast(task, task.url, videoPart, control, "Video HD", "video", task.sourceFormatId ?: "video")',
+              expected=2,
+          )
+          replace_exact(
+              service,
+              'downloadStagingStream(task, audioUrl, audioPart, control, "Audio")',
+              'downloadYouTubeTrackFast(task, audioUrl, audioPart, control, "Audio", "audio", task.secondarySourceFormatId ?: "audio")',
+          )
+          replace_exact(
+              service,
+              'downloadStagingStream(task, task.secondaryUrl ?: audioUrl, audioPart, control, "Audio")',
+              'downloadYouTubeTrackFast(task, task.secondaryUrl ?: audioUrl, audioPart, control, "Audio", "audio", task.secondarySourceFormatId ?: "audio")',
+          )
+          youtube_fast = block(
+              '''
+              private fun downloadYouTubeTrackFast(
+                  task: DownloadTask,
+                  url: String,
+                  target: File,
+                  control: TransferControl,
+                  label: String,
+                  trackName: String,
+                  stableId: String
+              ) {
+                  val metaFile = youtubeTrackMetaFile(task.id, trackName)
+                  val settings = SettingsRepository.settings.value
+                  val requested = if (settings.turboMode) maxOf(6, settings.segmentsPerFile) else settings.segmentsPerFile
+                  val segmented = try {
+                      YouTubeMultiRangeDownloader.downloadIfSupported(
+                          client = client,
+                          task = task,
+                          url = url,
+                          target = target,
+                          metaFile = metaFile,
+                          stableId = stableId,
+                          control = control,
+                          requestedSegments = requested,
+                          throttle = { bytes -> bandwidthLimiter.acquire(bytes) },
+                          networkAllowed = { ensureNetworkPolicy(task.id, control) },
+                          onProgress = { downloaded, total, speed, connections ->
+                              DownloadRepository.updateProgress(
+                                  task.id,
+                                  downloaded,
+                                  total,
+                                  speed,
+                                  "$label · $connections conexiones"
+                              )
+                              updateAggregateNotificationThrottled()
+                          }
+                      )
+                  } catch (error: YouTubeTrackHttpException) {
+                      throw HttpStatusException(error.statusCode, error.message ?: "HTTP ${error.statusCode} al descargar $label")
+                  }
+                  if (!segmented && !control.stopped.get()) {
+                      if (metaFile.exists()) {
+                          runCatching { metaFile.delete() }
+                          runCatching { target.delete() }
+                      }
+                      downloadStagingStream(task, url, target, control, label)
+                  }
+              }
+              ''',
+              4,
+          )
+          replace_exact(service, "    private fun downloadStagingStream(\n", youtube_fast + "\n\n    private fun downloadStagingStream(\n")
+          replace_exact(
+              service,
+              '    private fun youtubeMuxFile(id: String, container: String): File = File(downloadsDirectory(), ".$id.muxing.$container")',
+              '    private fun youtubeMuxFile(id: String, container: String): File = File(downloadsDirectory(), ".$id.muxing.$container")\n'
+              '    private fun youtubeTrackMetaFile(id: String, track: String): File = File(downloadsDirectory(), ".$id.$track.ytsegments")',
+          )
+          replace_exact(
+              service,
+              '        runCatching { youtubeAudioFile(id).delete() }\n',
+              '        runCatching { youtubeAudioFile(id).delete() }\n'
+              '        runCatching { youtubeTrackMetaFile(id, "video").delete() }\n'
+              '        runCatching { youtubeTrackMetaFile(id, "audio").delete() }\n',
+          )
+          replace_exact(
+              service,
+              '        runCatching { videoPart.delete() }\n        runCatching { audioPart.delete() }\n',
+              '        runCatching { videoPart.delete() }\n'
+              '        runCatching { audioPart.delete() }\n'
+              '        runCatching { youtubeTrackMetaFile(task.id, "video").delete() }\n'
+              '        runCatching { youtubeTrackMetaFile(task.id, "audio").delete() }\n',
+          )
+          replace_exact(
+              service,
+              "    private fun requestBuilder(task: DownloadTask): Request.Builder {\n"
+              "        val builder = Request.Builder().url(task.url)",
+              "    private fun requestBuilder(task: DownloadTask): Request.Builder {\n"
+              "        val builder = Request.Builder().url(SecurityUrlPolicy.requirePublicHttps(task.url))",
+          )
+          replace_exact(
+              service,
+              '        val builder = Request.Builder().url(url).header("Accept-Encoding", "identity").get()',
+              '        val builder = Request.Builder().url(SecurityUrlPolicy.requirePublicHttps(url)).header("Accept-Encoding", "identity").get()',
+          )
+          replace_exact(
+              service,
+              '    private fun ensureForeground(text: String) {\n'
+              '        startForeground(NOTIFICATION_ID, buildNotification("Manager Downloader", text, -1))\n'
+              '    }',
+              block(
+                  '''
+                  private fun ensureForeground(text: String) {
+                      val notification = buildNotification("Manager Downloader", text, -1)
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                          ServiceCompat.startForeground(
+                              this,
+                              NOTIFICATION_ID,
+                              notification,
+                              ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                          )
+                      } else {
+                          startForeground(NOTIFICATION_ID, notification)
+                      }
+                  }
+                  ''',
+                  4,
+              ),
+          )
+          old_pi = block(
+              '''
+              private fun serviceActionIntent(action: String, requestCode: Int): PendingIntent =
+                  PendingIntent.getService(
+                      this,
+                      requestCode,
+                      Intent(this, DownloadService::class.java).setAction(action),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  )
+              ''',
+              4,
+          )
+          new_pi = block(
+              '''
+              private fun serviceActionIntent(action: String, requestCode: Int): PendingIntent {
+                  val intent = Intent(this, DownloadService::class.java).setAction(action)
+                  val flags = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      PendingIntent.getForegroundService(this, requestCode, intent, flags)
+                  } else {
+                      PendingIntent.getService(this, requestCode, intent, flags)
+                  }
+              }
+              ''',
+              4,
+          )
+          replace_exact(service, old_pi, new_pi)
+          replace_exact(service, "        transferExecutor.shutdownNow()", "        transferExecutor.shutdown()")
+          replace_exact(service, "        segmentExecutor.shutdownNow()", "        segmentExecutor.shutdown()")
+
+          # ---------------- Browser WebView bridge / navigation ----------------
+          browser = "app/src/main/java/com/managerdownloader/app/ui/BrowserScreen.kt"
+          replace_exact(browser, "import android.webkit.JavascriptInterface\n", "")
+          replace_exact(
+              browser,
+              "import androidx.compose.foundation.horizontalScroll\n",
+              "import androidx.compose.foundation.horizontalScroll\n"
+              "import androidx.webkit.JavaScriptReplyProxy\n"
+              "import androidx.webkit.WebMessageCompat\n"
+              "import androidx.webkit.WebViewCompat\n"
+              "import androidx.webkit.WebViewFeature\n",
+          )
+          replace_exact(browser, "import com.managerdownloader.app.hls.HlsManifestClient\n", "import com.managerdownloader.app.hls.HlsManifestClient\nimport com.managerdownloader.app.security.SecurityUrlPolicy\n")
+          replace_exact(
+              browser,
+              'initialUrl?.trim()?.takeIf { it.startsWith("http://", true) || it.startsWith("https://", true) }',
+              'initialUrl?.trim()?.takeIf { SecurityUrlPolicy.isSafePublicHttps(it) }',
+          )
+          replace_exact(
+              browser,
+              "        if (item.url.isBlank()) return\n",
+              "        if (item.url.isBlank()) return\n"
+              "        if (item.url.startsWith(\"https://\", true) && !SecurityUrlPolicy.isSafePublicHttps(item.url)) return\n",
+          )
+          replace_exact(
+              browser,
+              "        val normalized = browserUrl(input, SettingsRepository.settings.value.searchEngine)\n",
+              "        if (input.startsWith(\"http://\", true)) {\n"
+              "            pageError = \"HTTP sin cifrar está bloqueado por seguridad. Usa HTTPS.\"\n"
+              "            return\n"
+              "        }\n\n"
+              "        val normalized = browserUrl(input, SettingsRepository.settings.value.searchEngine)\n"
+              "        if (normalized.startsWith(\"https://\", true) && !SecurityUrlPolicy.isSafePublicHttps(normalized)) {\n"
+              "            pageError = \"Destino local/privado bloqueado por seguridad.\"\n"
+              "            return\n"
+              "        }\n",
+          )
+
+          bridge_body = block(
+              '''
+              if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
+                  WebViewCompat.addWebMessageListener(
+                      this,
+                      JS_BRIDGE_NAME,
+                      setOf("*"),
+                      SecureMediaBridgeListener(
+                          activePageUrlProvider = { activePageUrlRef.get() },
+                          browserSafeModeProvider = { browserSafeModeRef.get() },
+                          onFound = { rawUrl, typeHint ->
+                              if (YouTubeUrlParser.parse(activePageUrlRef.get()) == null) {
+                                  val kind = mediaKindForUrl(rawUrl, typeHint)
+                                  if (kind != null) {
+                                      rememberMedia(
+                                          detectedItem(
+                                              url = rawUrl,
+                                              webView = createdView,
+                                              kind = kind,
+                                              referer = activePageUrlRef.get()
+                                          )
+                                      )
+                                  }
+                              }
+                          }
+                      )
+                  )
+              }
+              ''',
+              0,
+          )
+          pattern = r"(?P<i>[ \t]+)runCatching \{\s*addJavascriptInterface\(.*?JS_BRIDGE_NAME\s*\)\s*\}\s*\n(?P=i)webChromeClient ="
+          data = read(browser)
+          m = re.search(pattern, data, flags=re.S)
+          if not m:
+              raise SystemExit("PATCH ERROR BrowserScreen: legacy JS bridge block not found")
+          indent = m.group("i")
+          replacement = textwrap.indent(bridge_body, indent) + "\n\n" + indent + "webChromeClient ="
+          write(browser, data[:m.start()] + replacement + data[m.end():])
+
+          data = read(browser)
+          nav_pattern = (
+              r'(?P<i>[ \t]+)if \(url\.startsWith\("http://", true\) \|\| url\.startsWith\("https://", true\) \|\| url\.startsWith\("about:", true\)\) \{\n'
+              r'(?P=i)    return false\n'
+              r'(?P=i)\}\n'
+              r'(?P=i)openExternal\(context, url\)'
+          )
+          match = re.search(nav_pattern, data)
+          if not match:
+              raise SystemExit("PATCH ERROR BrowserScreen: navigation block not found")
+          indent = match.group("i")
+          nav_replacement = (
+              indent + 'if (url.startsWith("http://", true)) {\n' +
+              indent + '    pageError = "HTTP sin cifrar está bloqueado por seguridad."\n' +
+              indent + '    return true\n' +
+              indent + '}\n' +
+              indent + 'if (url.startsWith("https://", true)) {\n' +
+              indent + '    if (!SecurityUrlPolicy.isSafePublicHttps(url)) {\n' +
+              indent + '        pageError = "Destino local/privado bloqueado por seguridad."\n' +
+              indent + '        return true\n' +
+              indent + '    }\n' +
+              indent + '    return false\n' +
+              indent + '}\n' +
+              indent + 'if (url.startsWith("about:", true)) return false\n' +
+              indent + 'openExternal(context, url)'
+          )
+          write(browser, data[:match.start()] + nav_replacement + data[match.end():])
+          # After the initial URL expression was patched above, this is the renderer recovery occurrence.
+          replace_exact(
+              browser,
+              '?.takeIf { it.startsWith("http://", true) || it.startsWith("https://", true) }',
+              '?.takeIf { SecurityUrlPolicy.isSafePublicHttps(it) }',
+          )
+
+          listener = '''private class SecureMediaBridgeListener(
+              private val activePageUrlProvider: () -> String,
+              private val browserSafeModeProvider: () -> Boolean,
+              private val onFound: (String, String) -> Unit
+          ) : WebViewCompat.WebMessageListener {
+              private val rateWindowStartedAt = AtomicLong(System.currentTimeMillis())
+              private val callbacksInWindow = AtomicInteger(0)
+
+              override fun onPostMessage(
+                  view: WebView,
+                  message: WebMessageCompat,
+                  sourceOrigin: Uri,
+                  isMainFrame: Boolean,
+                  replyProxy: JavaScriptReplyProxy
+              ) {
+                  if (!isMainFrame || browserSafeModeProvider()) return
+                  if (message.type != WebMessageCompat.TYPE_STRING) return
+                  if (!SecurityUrlPolicy.sameHttpsOrigin(activePageUrlProvider(), sourceOrigin)) return
+                  val payload = message.data.orEmpty()
+                  if (payload.length > MAX_SNIFFER_URL_LENGTH + 32) return
+                  val separator = payload.indexOf('\\n')
+                  if (separator <= 0) return
+                  val typeHint = payload.substring(0, separator).trim().take(24)
+                  val url = payload.substring(separator + 1).trim()
+                  if (url.isBlank() || url.length > MAX_SNIFFER_URL_LENGTH) return
+                  if (
+                      !url.startsWith("blob:", true) &&
+                      !url.startsWith("magnet:", true) &&
+                      !SecurityUrlPolicy.isSafePublicHttps(url)
+                  ) return
+
+                  val now = System.currentTimeMillis()
+                  val windowStart = rateWindowStartedAt.get()
+                  if (now - windowStart >= SNIFFER_RATE_WINDOW_MS && rateWindowStartedAt.compareAndSet(windowStart, now)) {
+                      callbacksInWindow.set(0)
+                  }
+                  if (callbacksInWindow.incrementAndGet() > MAX_SNIFFER_CALLBACKS_PER_WINDOW) return
+                  if (view.isAttachedToWindow) onFound(url, typeHint)
+              }
+          }
+          '''
+          regex_once(browser, r"private class MediaSnifferBridge\(.*?\n\}\n\nprivate fun installBoundedMediaSniffer", listener + "\nprivate fun installBoundedMediaSniffer")
+          replace_exact(
+              browser,
+              "    runCatching { view.removeJavascriptInterface(JS_BRIDGE_NAME) }",
+              "    runCatching {\n"
+              "        if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {\n"
+              "            WebViewCompat.removeWebMessageListener(view, JS_BRIDGE_NAME)\n"
+              "        }\n"
+              "    }\n"
+              "    runCatching { view.removeJavascriptInterface(JS_BRIDGE_NAME) }",
+              expected=2,
+          )
+          replace_exact(browser, 'cookie = if (url.startsWith("http", true)) {', 'cookie = if (url.startsWith("https://", true)) {', expected=2)
+          replace_exact(
+              browser,
+              '    if (!trimmed.startsWith("http://", true) && !trimmed.startsWith("https://", true)) return null\n',
+              '    if (!trimmed.startsWith("https://", true)) return null\n    if (!SecurityUrlPolicy.isSafePublicHttps(trimmed)) return null\n',
+          )
+          old_scheme = (
+              'private fun isDownloadableScheme(url: String): Boolean =\n'
+              '    url.startsWith("http://", true) ||\n'
+              '        url.startsWith("https://", true) ||\n'
+              '        url.startsWith("magnet:", true)'
+          )
+          new_scheme = (
+              'private fun isDownloadableScheme(url: String): Boolean =\n'
+              '    (url.startsWith("https://", true) && SecurityUrlPolicy.isSafePublicHttps(url)) ||\n'
+              '        url.startsWith("magnet:", true)'
+          )
+          replace_exact(browser, old_scheme, new_scheme)
+          replace_exact(browser, 'if (!/^https?:/i.test(url)) return url;', 'if (!/^https:/i.test(url)) return url;')
+          replace_exact(
+              browser,
+              "if (!/^https?:/i.test(absolute) && absolute.indexOf('blob:') !== 0 && absolute.indexOf('magnet:') !== 0) return;",
+              "if (!/^https:/i.test(absolute) && absolute.indexOf('blob:') !== 0 && absolute.indexOf('magnet:') !== 0) return;",
+          )
+          replace_exact(browser, "bridge.onMediaFound(absolute, type || 'unknown');", "bridge.postMessage(String(type || 'unknown').slice(0, 24) + '\\n' + absolute);")
+          replace_exact(browser, "if (!bridge || !bridge.onMediaFound) return;", "if (!bridge || !bridge.postMessage) return;")
+
+          # ---------------- Direct-download UI: reject cleartext before enqueue ----------------
+          downloads_screen = "app/src/main/java/com/managerdownloader/app/ui/DownloadsScreen.kt"
+          replace_exact(
+              downloads_screen,
+              "import com.managerdownloader.app.download.DownloadService\n",
+              "import com.managerdownloader.app.download.DownloadService\nimport com.managerdownloader.app.security.SecurityUrlPolicy\n",
+          )
+          replace_exact(
+              downloads_screen,
+              'private fun normalizeUrl(value: String): String? {\n    val trimmed = value.trim()\n    if (trimmed.startsWith("magnet:", true)) return trimmed\n    val candidate = if (trimmed.startsWith("http://", true) || trimmed.startsWith("https://", true)) {\n        trimmed\n    } else {\n        "https://$trimmed"\n    }\n    return candidate.takeIf {\n        runCatching {\n            val parsed = android.net.Uri.parse(it)\n            !parsed.host.isNullOrBlank() &&\n                (parsed.scheme.equals("http", true) || parsed.scheme.equals("https", true))\n        }.getOrDefault(false)\n    }\n}',
+              'private fun normalizeUrl(value: String): String? {\n    val trimmed = value.trim()\n    if (trimmed.startsWith("magnet:", true)) return trimmed\n    if (trimmed.startsWith("http://", true)) return null\n    val candidate = if (trimmed.startsWith("https://", true)) trimmed else "https://$trimmed"\n    return candidate.takeIf { SecurityUrlPolicy.isSafePublicHttps(it) }\n}'
+          )
+
+          # ---------------- Changelog ----------------
+          # R5 generated-source integrity checks. These catch the exact class of errors
+          # that R3 exposed before Gradle spends time compiling the project.
+          browser_generated = read(browser)
+          if r"val separator = payload.indexOf('\n')" not in browser_generated:
+              raise SystemExit("R5 SOURCE ERROR: el literal Kotlin '\\n' del WebMessage bridge quedó alterado")
+          if "payload.indexOf('\n')" in browser_generated:
+              raise SystemExit("R5 SOURCE ERROR: apareció un salto real dentro del literal Kotlin")
+          security_generated = read("app/src/main/java/com/managerdownloader/app/security/SecurityUrlPolicy.kt")
+          if "val publicDns: Dns = object : Dns" not in security_generated:
+              raise SystemExit("R5 SOURCE ERROR: publicDns no usa implementación explícita de Dns")
+          if "override fun lookup(hostname: String): List<InetAddress>" not in security_generated:
+              raise SystemExit("R5 SOURCE ERROR: falta override lookup(String) en publicDns")
+
+          changelog = Path("CHANGELOG.md")
+          if changelog.exists():
+              original = changelog.read_text(encoding="utf-8")
+              if not original.startswith("# v0.8.1"):
+                  entry = """# v0.8.1 — Security, resume stability and throughput
+
+          - Global cleartext HTTP disabled; automatic remote analyzers require public HTTPS.
+          - WebView media bridge migrated from addJavascriptInterface to origin-checked WebMessageListener.
+          - HLS/NewPipe responses bounded and SSRF-resistant DNS added.
+          - JitPack scoped to TeamNewPipe.
+          - Release minification/R8 enabled; legacy debug-publishing upgrade workflows retired.
+          - HTTP segmented pause is cooperative (no Future.cancel(true) on FileChannel writers).
+          - Torrent SessionManager is process-wide to avoid JNI stop/start races.
+          - YouTube HD tracks use resumable multi-range downloads when supported.
+
+          """
+                  changelog.write_text(entry + original, encoding="utf-8")
+          PY
+
+      - name: Retire insecure bootstrap workflows and bundles
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm -f --ignore-unmatch .github/workflows/upgrade-v0*.yml || true
+          git rm -f --ignore-unmatch .github/workflows/security-v081*.yml || true
+          git rm -f --ignore-unmatch manager_downloader_v0*_upgrade.zip || true
+          git rm -f --ignore-unmatch "$BUNDLE" || true
+
+      - name: Add CODEOWNERS review marker
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .github
+          cat > .github/CODEOWNERS <<'OWNERS'
+          * @stivencop414-bot
+          /.github/ @stivencop414-bot
+          /app/src/main/java/com/managerdownloader/app/download/ @stivencop414-bot
+          /app/src/main/java/com/managerdownloader/app/security/ @stivencop414-bot
+          OWNERS
+
+      - name: Security and regression preflight
+        shell: bash
+        run: |
+          set -uo pipefail
+          LOG=/tmp/v081-security-preflight.log
+          : > "$LOG"
+          FAIL=0
+          check() {
+            local label="$1" file="$2" needle="$3"
+            if grep -Fq "$needle" "$file"; then
+              echo "PASS | $label" | tee -a "$LOG"
+            else
+              echo "FAIL | $label | $file | $needle" | tee -a "$LOG"
+              FAIL=1
+            fi
+          }
+          reject() {
+            local label="$1" file="$2" needle="$3"
+            if grep -Fq "$needle" "$file"; then
+              echo "FAIL | $label | forbidden: $needle" | tee -a "$LOG"
+              FAIL=1
+            else
+              echo "PASS | $label" | tee -a "$LOG"
+            fi
+          }
+
+          check version app/build.gradle.kts '?: "0.8.1"'
+          check tls-manifest app/src/main/AndroidManifest.xml 'android:usesCleartextTraffic="false"'
+          check tls-config app/src/main/res/xml/network_security_config.xml 'cleartextTrafficPermitted="false"'
+          if grep -R -n -E 'usesCleartextTraffic="true"|cleartextTrafficPermitted="true"' app/src/main >/tmp/v081-cleartext.txt 2>/dev/null; then
+            echo "FAIL | cleartext global todavía habilitado" | tee -a "$LOG"
+            cat /tmp/v081-cleartext.txt | tee -a "$LOG"
+            FAIL=1
+          else
+            echo "PASS | cleartext global bloqueado" | tee -a "$LOG"
+          fi
+          check jitpack-scope settings.gradle.kts 'includeGroup("com.github.TeamNewPipe")'
+          check secure-url-policy app/src/main/java/com/managerdownloader/app/security/SecurityUrlPolicy.kt 'publicDns'
+          check dns-object app/src/main/java/com/managerdownloader/app/security/SecurityUrlPolicy.kt 'val publicDns: Dns = object : Dns'
+          check dns-lookup-override app/src/main/java/com/managerdownloader/app/security/SecurityUrlPolicy.kt 'override fun lookup(hostname: String): List<InetAddress>'
+          check webmessage-newline-literal app/src/main/java/com/managerdownloader/app/ui/BrowserScreen.kt "val separator = payload.indexOf('\\n')"
+          check download-public-dns app/src/main/java/com/managerdownloader/app/download/DownloadService.kt '.dns(SecurityUrlPolicy.publicDns)'
+          check generic-download-https app/src/main/java/com/managerdownloader/app/download/DownloadService.kt 'SecurityUrlPolicy.requirePublicHttps(task.url)'
+          check staging-download-https app/src/main/java/com/managerdownloader/app/download/DownloadService.kt 'SecurityUrlPolicy.requirePublicHttps(url)'
+          check no-tls-downgrade app/src/main/java/com/managerdownloader/app/download/DownloadService.kt '.followSslRedirects(false)'
+          check bounded-hls app/src/main/java/com/managerdownloader/app/hls/HlsManifestParser.kt 'MAX_HLS_MANIFEST_BYTES'
+          check bounded-extractor app/src/main/java/com/managerdownloader/app/youtube/YouTubeSupport.kt 'MAX_EXTRACTOR_RESPONSE_BYTES'
+          check progressive-https app/src/main/java/com/managerdownloader/app/youtube/YouTubeSupport.kt '!it.isVideoOnly && SecurityUrlPolicy.isSafePublicHttps(it.content)'
+          reject extractor-http-filter app/src/main/java/com/managerdownloader/app/youtube/YouTubeSupport.kt 'it.content.startsWith("http")'
+          check yt-track-https app/src/main/java/com/managerdownloader/app/download/YouTubeMultiRangeDownloader.kt 'SecurityUrlPolicy.requirePublicHttps(url)'
+          check webmessage app/src/main/java/com/managerdownloader/app/ui/BrowserScreen.kt 'WebViewCompat.addWebMessageListener'
+          check origin-check app/src/main/java/com/managerdownloader/app/ui/BrowserScreen.kt 'sameHttpsOrigin'
+          check webmessage-string-only app/src/main/java/com/managerdownloader/app/ui/BrowserScreen.kt 'message.type != WebMessageCompat.TYPE_STRING'
+          check direct-ui-https app/src/main/java/com/managerdownloader/app/ui/DownloadsScreen.kt 'if (trimmed.startsWith("http://", true)) return null'
+          check direct-ui-public-policy app/src/main/java/com/managerdownloader/app/ui/DownloadsScreen.kt 'SecurityUrlPolicy.isSafePublicHttps(it)'
+          reject legacy-js-bridge app/src/main/java/com/managerdownloader/app/ui/BrowserScreen.kt '@JavascriptInterface'
+          check r8 app/build.gradle.kts 'isMinifyEnabled = true'
+          check rhino-r8-origin app/proguard-rules.pro '-dontwarn org.mozilla.javascript.JavaToJSONConverters'
+          check rhino-r8-engine app/proguard-rules.pro '-keep class org.mozilla.javascript.engine.** { *; }'
+          check rhino-r8-javax-script app/proguard-rules.pro '-dontwarn javax.script.**'
+          check rhino-r8-dynalink app/proguard-rules.pro '-dontwarn jdk.dynalink.**'
+          check r8-java-beans-descriptor app/proguard-rules.pro '-dontwarn java.beans.BeanDescriptor'
+          check r8-java-beans-info app/proguard-rules.pro '-dontwarn java.beans.BeanInfo'
+          check r8-java-beans-introspection-exception app/proguard-rules.pro '-dontwarn java.beans.IntrospectionException'
+          check r8-java-beans-introspector app/proguard-rules.pro '-dontwarn java.beans.Introspector'
+          check r8-java-beans-property app/proguard-rules.pro '-dontwarn java.beans.PropertyDescriptor'
+          if grep -Eq '^[[:space:]]*-ignorewarnings([[:space:]]|$)' app/proguard-rules.pro; then
+            echo "FAIL | R8 global ignorewarnings prohibido" | tee -a "$LOG"
+            FAIL=1
+          else
+            echo "PASS | sin ignorewarnings global" | tee -a "$LOG"
+          fi
+          check torrent-singleton app/src/main/java/com/managerdownloader/app/download/TorrentEngine.kt 'internal object TorrentSessionHolder'
+          check youtube-multirange app/src/main/java/com/managerdownloader/app/download/YouTubeMultiRangeDownloader.kt 'downloadIfSupported'
+          check foreground-type app/src/main/java/com/managerdownloader/app/download/DownloadService.kt 'FOREGROUND_SERVICE_TYPE_DATA_SYNC'
+          check fgs-pendingintent app/src/main/java/com/managerdownloader/app/download/DownloadService.kt 'PendingIntent.getForegroundService'
+          check stop-race app/src/main/java/com/managerdownloader/app/download/DownloadService.kt 'stopSelfResult(stopId)'
+          check cooperative-permit app/src/main/java/com/managerdownloader/app/download/DownloadService.kt 'segmentPermits.tryAcquire(200L, TimeUnit.MILLISECONDS)'
+          reject eager-torrent-resume app/src/main/java/com/managerdownloader/app/download/DownloadService.kt 'torrentEngine.resume(id)'
+          reject filechannel-interrupt app/src/main/java/com/managerdownloader/app/download/DownloadService.kt 'futures.forEach { it.cancel(true) }'
+          check range-probe app/src/main/java/com/managerdownloader/app/download/DownloadService.kt 'parsedRange.end >= 0L'
+          check range-overreturn-cap app/src/main/java/com/managerdownloader/app/download/DownloadService.kt 'val accepted = minOf(read.toLong(), remaining).toInt()'
+          check atomic-persistence app/src/main/java/com/managerdownloader/app/data/DownloadRepository.kt 'AtomicFile'
+          check power-lock app/src/main/java/com/managerdownloader/app/download/SafePowerManager.kt 'PARTIAL_WAKE_LOCK'
+
+          mkdir -p .github/workflows
+          if find .github/workflows -maxdepth 1 -type f -name 'upgrade-v0*.yml' 2>/dev/null | grep -q .; then
+            echo "FAIL | legacy workflows siguen presentes" | tee -a "$LOG"
+            FAIL=1
+          else
+            echo "PASS | legacy workflows retirados" | tee -a "$LOG"
+          fi
+          if find .github/workflows -maxdepth 1 -type f -name 'security-v081*.yml' 2>/dev/null | grep -q .; then
+            echo "FAIL | workflows bootstrap v0.8.1 siguen presentes" | tee -a "$LOG"
+            FAIL=1
+          else
+            echo "PASS | workflows bootstrap v0.8.1 retirados" | tee -a "$LOG"
+          fi
+          if grep -R -E 'gh release (upload|create).*app-debug|cp .*app-debug.apk.*ManagerDownloader.apk' .github/workflows >/dev/null 2>&1; then
+            echo "FAIL | un workflow todavía publica APK debug" | tee -a "$LOG"
+            FAIL=1
+          else
+            echo "PASS | no se publica APK debug" | tee -a "$LOG"
+          fi
+
+          git diff --check 2>&1 | tee -a "$LOG" || FAIL=1
+          git status --short | tee -a "$LOG"
+          if [ "$FAIL" -ne 0 ]; then
+            echo "Preflight falló. No se hará push de la rama candidata." | tee -a "$LOG"
+            exit 1
+          fi
+
+      - name: Upload preflight log
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: v081-r5-security-preflight
+          path: /tmp/v081-security-preflight.log
+          if-no-files-found: ignore
+
+      - name: Save reviewable candidate diff
+        shell: bash
+        run: git diff --binary > /tmp/v081-security-candidate.diff
+
+      - name: Upload candidate diff
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: v081-r5-security-candidate-diff
+          path: /tmp/v081-security-candidate.diff
+          if-no-files-found: ignore
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 36
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses || true
+          sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Set up Gradle 9.5
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.5.0"
+
+      - name: Compile Kotlin source gate
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle --no-daemon :app:compileDebugKotlin \
+            -PVERSION_CODE=${{ github.run_number }} \
+            -PVERSION_NAME=0.8.1 2>&1 | tee /tmp/v081-kotlin-build.log
+
+      - name: Compile debug as regression gate only
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle --no-daemon :app:assembleDebug \
+            -PVERSION_CODE=${{ github.run_number }} \
+            -PVERSION_NAME=0.8.1 2>&1 | tee /tmp/v081-debug-build.log
+
+      - name: Run R8 minifier gate
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle --no-daemon :app:minifyReleaseWithR8 \
+            -PVERSION_CODE=${{ github.run_number }} \
+            -PVERSION_NAME=0.8.1 2>&1 | tee /tmp/v081-r8-build.log
+
+      - name: Package release after R8 gate
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle --no-daemon :app:assembleRelease \
+            -PVERSION_CODE=${{ github.run_number }} \
+            -PVERSION_NAME=0.8.1 2>&1 | tee /tmp/v081-release-build.log
+
+      - name: Upload build logs only
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: v081-r5-build-logs
+          path: |
+            /tmp/v081-kotlin-build.log
+            /tmp/v081-debug-build.log
+            /tmp/v081-r8-build.log
+            /tmp/v081-release-build.log
+            app/build/outputs/mapping/release/missing_rules.txt
+            app/build/outputs/mapping/release/configuration.txt
+          if-no-files-found: ignore
+
+      - name: Commit candidate branch after successful builds
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --stat
+          git diff --cached --quiet && { echo "ERROR: no hay cambios para v0.8.1"; exit 1; }
+          git commit -m "Manager Downloader v0.8.1 security, resume and throughput hardening"
+          git push -u origin "$CANDIDATE_BRANCH"
+
+      - name: Open review Pull Request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/v081-pr-body.md <<'BODY'
+          ## Manager Downloader v0.8.1
+
+          Security + stability candidate generated from a SHA-256 verified, source-only bundle on a Git-blob-pinned v0.8.0 source base.
+
+          Security: TLS-only traffic, origin-checked WebMessageListener, bounded HLS/NewPipe responses, public-DNS SSRF defense, scoped JitPack, R8, and retirement of legacy direct-main/debug-release workflows.
+
+          Resume/throughput: cooperative HTTP pause without Future.cancel(true) on FileChannel writers, startId-aware service shutdown, process-wide libtorrent SessionManager, fixed Range probe, and resumable multi-range YouTube HD tracks.
+
+          Release/R8: NewPipe/Rhino Android rules are applied without disabling minification or using a global warning bypass. The exact JVM-only java.beans references reported by the R4 release build are scoped out.
+
+          This workflow does not publish APKs, force tags, or push directly to main. Review and merge this PR first.
+          BODY
+
+          if gh pr create \
+            --base main \
+            --head "$CANDIDATE_BRANCH" \
+            --title "Manager Downloader v0.8.1 — security + stability" \
+            --body-file /tmp/v081-pr-body.md; then
+            echo "Pull Request creado correctamente."
+          else
+            echo "::warning::La rama candidata sí fue publicada, pero GitHub no permitió crear el PR automáticamente."
+            echo "Abre manualmente un PR desde $CANDIDATE_BRANCH hacia main."
+          fi
+
+      - name: Final security note
+        shell: bash
+        run: |
+          echo "v0.8.1 R5 candidato listo. No se modificó main automáticamente."
+          echo "Activa Branch Protection/Ruleset para main y exige PR antes de merge."
+          echo "No publiques una APK hasta configurar firma de producción."
